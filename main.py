@@ -157,19 +157,17 @@ class SceneAnalyzer:
         """从事件提取消息记录"""
         sender_id = event.get_sender_id()
 
-        # 提取消息内容，处理纯图片等无文本的情况
+        # 提取消息内容，拼接所有文本和图片描述
         content = event.message_str or ""
         if not content:
-            # 尝试从消息组件中提取描述
+            # message_str 为空时，从消息组件中拼接
+            parts: list[str] = []
             for comp in event.get_messages():
                 if isinstance(comp, Plain) and comp.text:
-                    content = comp.text
-                    break
+                    parts.append(comp.text)
                 elif isinstance(comp, Image):
-                    content = "[图片]"
-                    break
-            if not content:
-                content = "[消息]"
+                    parts.append("[图片]")
+            content = "".join(parts) if parts else "[消息]"
 
         msg = MessageRecord(
             msg_id=str(event.message_obj.message_id),
