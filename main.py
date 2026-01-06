@@ -1,5 +1,5 @@
 """
-AstrBot 上下文场景感知增强插件 v2.1 (Context-Aware Enhancement)
+AstrBot 上下文场景感知增强插件 v2.1.1 (Context-Aware Enhancement)
 
 为 LLM 提供结构化的群聊场景描述，增强其对对话情境的理解能力。
 重点解决：主动回复时 Bot 误以为别人在问自己的问题。
@@ -16,8 +16,8 @@ AstrBot 上下文场景感知增强插件 v2.1 (Context-Aware Enhancement)
 - 与框架 LongTermMemory 协作而非冲突
 - 轻量高效，不影响响应速度
 
-Author: AstrBot
-Version: 2.1.0
+Author: 木有知
+Version: 2.1.1
 """
 
 from __future__ import annotations
@@ -156,11 +156,26 @@ class SceneAnalyzer:
     def extract_message(self, event: AstrMessageEvent) -> MessageRecord:
         """从事件提取消息记录"""
         sender_id = event.get_sender_id()
+
+        # 提取消息内容，处理纯图片等无文本的情况
+        content = event.message_str or ""
+        if not content:
+            # 尝试从消息组件中提取描述
+            for comp in event.get_messages():
+                if isinstance(comp, Plain) and comp.text:
+                    content = comp.text
+                    break
+                elif isinstance(comp, Image):
+                    content = "[图片]"
+                    break
+            if not content:
+                content = "[消息]"
+
         msg = MessageRecord(
             msg_id=str(event.message_obj.message_id),
             sender_id=sender_id,
             sender_name=event.get_sender_name() or sender_id,
-            content=event.message_str[:500],
+            content=content[:500],
             timestamp=time.time(),
             is_bot=(sender_id == self._bot_id),
         )
@@ -434,7 +449,7 @@ class Main(star.Star):
         self._bot_id: str | None = None
         self._analyzer: SceneAnalyzer | None = None
 
-        logger.info("[ContextAware] 插件 v2.1 已加载")
+        logger.info("[ContextAware] 插件 v2.1.1 已加载")
 
     def _cfg(self, key: str, default: object = None) -> object:
         """获取配置项"""
