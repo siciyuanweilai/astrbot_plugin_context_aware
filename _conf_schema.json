@@ -1,0 +1,48 @@
+{
+  "enable": {
+    "description": "启用上下文场景感知",
+    "type": "bool",
+    "default": true
+  },
+  "bot_names": {
+    "description": "Bot的各种称呼（用于检测被提及，不填则不检测）",
+    "type": "list",
+    "default": [],
+    "hint": "例如填写: 小助手, 机器人, bot"
+  },
+  "max_history": {
+    "description": "每个群保留的最大历史消息数",
+    "type": "int",
+    "default": 50
+  },
+  "max_groups": {
+    "description": "最大缓存群数量（LRU淘汰策略，防止内存溢出）",
+    "type": "int",
+    "default": 100
+  },
+  "dialogue_window": {
+    "description": "注入LLM的对话流窗口大小（最近N条消息）",
+    "type": "int",
+    "default": 8
+  },
+  "enable_dialogue_flow": {
+    "description": "启用对话流分析（谁在和谁说话）",
+    "type": "bool",
+    "default": true
+  },
+  "enable_topic_keywords": {
+    "description": "启用话题关键词提取",
+    "type": "bool",
+    "default": true
+  },
+  "enable_context_hint": {
+    "description": "启用回复建议（给LLM的参考提示）",
+    "type": "bool",
+    "default": true
+  },
+  "only_group_chat": {
+    "description": "仅对群聊生效（私聊场景无需复杂分析）",
+    "type": "bool",
+    "default": true
+  }
+}
