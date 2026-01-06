@@ -17,7 +17,7 @@ AstrBot 上下文场景感知增强插件 v2.1.1 (Context-Aware Enhancement)
 - 轻量高效，不影响响应速度
 
 Author: 木有知
-Version: 2.1.1
+Version: 2.1.2
 """
 
 from __future__ import annotations
@@ -486,7 +486,7 @@ class Main(star.Star):
     # -------------------------------------------------------------------------
 
     @filter.platform_adapter_type(filter.PlatformAdapterType.ALL)
-    async def on_message(self, event: AstrMessageEvent):
+    async def on_message(self, event: AstrMessageEvent, **kwargs):
         """监听所有消息，记录到历史"""
         if not self._should_process(event):
             return
