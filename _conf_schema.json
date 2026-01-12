@@ -30,16 +30,6 @@
     "type": "bool",
     "default": true
   },
-  "enable_topic_keywords": {
-    "description": "启用话题关键词提取",
-    "type": "bool",
-    "default": true
-  },
-  "enable_context_hint": {
-    "description": "启用回复建议（给LLM的参考提示）",
-    "type": "bool",
-    "default": true
-  },
   "only_group_chat": {
     "description": "仅对群聊生效（私聊场景无需复杂分析）",
     "type": "bool",

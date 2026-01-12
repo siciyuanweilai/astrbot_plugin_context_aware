@@ -1,5 +1,5 @@
 """
-AstrBot 上下文场景感知增强插件 v2.1.1 (Context-Aware Enhancement)
+AstrBot 上下文场景感知增强插件 v2.2.0 (Context-Aware Enhancement)
 
 为 LLM 提供结构化的群聊场景描述，增强其对对话情境的理解能力。
 重点解决：主动回复时 Bot 误以为别人在问自己的问题。
@@ -16,8 +16,13 @@ AstrBot 上下文场景感知增强插件 v2.1.1 (Context-Aware Enhancement)
 - 与框架 LongTermMemory 协作而非冲突
 - 轻量高效，不影响响应速度
 
+v2.2.0 更新:
+- 增强日志输出，可清晰观测插件工作状态
+- 添加统计信息追踪
+- 修复类型安全问题
+
 Author: 木有知
-Version: 2.1.2
+Version: 2.2.0
 """
 
 from __future__ import annotations
@@ -25,13 +30,12 @@ from __future__ import annotations
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Any, Final
 
 from astrbot import logger
 from astrbot.api import star
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.message_components import At, Image, Plain, Reply
-from astrbot.api.platform import MessageType
 from astrbot.api.provider import LLMResponse, ProviderRequest
 from astrbot.core.agent.message import TextPart
 
@@ -51,6 +55,17 @@ TRIGGER_WAKE: Final = "wake_word"
 TRIGGER_MENTION: Final = "mention"
 TRIGGER_ACTIVE: Final = "active"
 TRIGGER_UNKNOWN: Final = "unknown"
+
+# 触发类型中文名（用于日志）
+TRIGGER_NAMES: Final = {
+    TRIGGER_PRIVATE: "私聊",
+    TRIGGER_AT: "@Bot",
+    TRIGGER_REPLY: "回复Bot",
+    TRIGGER_WAKE: "唤醒词",
+    TRIGGER_MENTION: "提及Bot",
+    TRIGGER_ACTIVE: "主动触发",
+    TRIGGER_UNKNOWN: "未知",
+}
 
 # 回复特征词（用于判断是否在回复 Bot）
 REPLY_STARTERS: Final = frozenset({
@@ -89,6 +104,19 @@ class SessionState:
     messages: list[MessageRecord] = field(default_factory=list)
     bot_last_spoke_at: float = 0.0
     bot_last_content: str = ""
+
+
+@dataclass
+class PluginStats:
+    """插件统计信息"""
+
+    messages_recorded: int = 0
+    scenes_injected: int = 0
+    bot_responses_recorded: int = 0
+    trigger_counts: dict[str, int] = field(default_factory=dict)
+
+    def record_trigger(self, trigger_type: str) -> None:
+        self.trigger_counts[trigger_type] = self.trigger_counts.get(trigger_type, 0) + 1
 
 
 # ============================================================================
@@ -135,6 +163,16 @@ class SessionManager:
     def has_session(self, session_id: str) -> bool:
         """检查会话是否存在"""
         return session_id in self._sessions
+
+    def get_session_count(self) -> int:
+        """获取当前会话数量"""
+        return len(self._sessions)
+
+    def get_message_count(self, session_id: str) -> int:
+        """获取会话消息数量"""
+        if session_id in self._sessions:
+            return len(self._sessions[session_id].messages)
+        return 0
 
 
 # ============================================================================
@@ -356,7 +394,7 @@ class SceneGenerator:
                 sender = "[你]" if m.is_bot else m.sender_name
                 preview = m.content[:20] + ("..." if len(m.content) > 20 else "")
                 flow_lines.append(f'    <m>{esc(sender)} → {esc(to_name)}: {esc(preview)}</m>')
-            parts.append(f'  <recent_flow>')
+            parts.append('  <recent_flow>')
             parts.extend(flow_lines)
             parts.append('  </recent_flow>')
 
@@ -424,7 +462,7 @@ class Main(star.Star):
     通过分析群聊消息结构，为 LLM 提供结构化的场景描述，
     帮助 Bot 更好地理解对话情境并做出恰当回应。
 
-    v2.1 重点解决：主动回复时 Bot 误以为别人在问自己的问题。
+    v2.2 更新：增强日志输出，让用户能清晰看到插件工作状态。
     """
 
     def __init__(
@@ -435,21 +473,22 @@ class Main(star.Star):
         super().__init__(context)
         self._config = config
 
-        self._enabled = self._cfg("enable", True)
-        self._group_only = self._cfg("only_group_chat", True)
+        self._enabled = bool(self._cfg("enable", True))
+        self._group_only = bool(self._cfg("only_group_chat", True))
 
         self._sessions = SessionManager(
-            max_messages=self._cfg("max_history", 50),
-            max_sessions=self._cfg("max_groups", 100),
+            max_messages=int(self._cfg("max_history", 50) or 50),
+            max_sessions=int(self._cfg("max_groups", 100) or 100),
         )
         self._scene_generator = SceneGenerator()
+        self._stats = PluginStats()
 
         self._bot_id: str | None = None
         self._analyzer: SceneAnalyzer | None = None
 
-        logger.info("[ContextAware] 插件 v2.1.1 已加载")
+        logger.info("[ContextAware] 插件 v2.2.0 已加载，增强日志已启用")
 
-    def _cfg(self, key: str, default: object = None) -> object:
+    def _cfg(self, key: str, default: Any = None) -> Any:
         """获取配置项"""
         if self._config is None:
             return default
@@ -473,12 +512,13 @@ class Main(star.Star):
             logger.warning("[ContextAware] 无法获取 Bot ID，跳过处理")
             return False
 
-        bot_names = self._cfg("bot_names", []) or []
-        if not isinstance(bot_names, list):
-            bot_names = []
+        bot_names_raw = self._cfg("bot_names", [])
+        bot_names: list[str] = []
+        if isinstance(bot_names_raw, list):
+            bot_names = [str(n) for n in bot_names_raw if n]
 
         self._analyzer = SceneAnalyzer(self._bot_id, bot_names)
-        logger.debug(f"[ContextAware] 初始化完成，Bot ID: {self._bot_id}")
+        logger.info(f"[ContextAware] 初始化完成，Bot ID: {self._bot_id}")
         return True
 
     # -------------------------------------------------------------------------
@@ -486,7 +526,7 @@ class Main(star.Star):
     # -------------------------------------------------------------------------
 
     @filter.platform_adapter_type(filter.PlatformAdapterType.ALL)
-    async def on_message(self, event: AstrMessageEvent, **kwargs):
+    async def on_message(self, event: AstrMessageEvent, *args: Any, **kwargs: Any) -> None:
         """监听所有消息，记录到历史"""
         if not self._should_process(event):
             return
@@ -500,11 +540,22 @@ class Main(star.Star):
         if not self._ensure_initialized(event):
             return
 
-        msg = self._analyzer.extract_message(event)  # type: ignore
+        assert self._analyzer is not None
+
+        msg = self._analyzer.extract_message(event)
         state = self._sessions.get(event.unified_msg_origin)
-        self._analyzer.infer_addressee(msg, state.messages)  # type: ignore
+        self._analyzer.infer_addressee(msg, state.messages)
 
         self._sessions.add_message(event.unified_msg_origin, msg)
+        self._stats.messages_recorded += 1
+
+        # 每记录 50 条消息输出一次统计
+        if self._stats.messages_recorded % 50 == 0:
+            logger.info(
+                f"[ContextAware] 统计: 已记录 {self._stats.messages_recorded} 条消息, "
+                f"已注入 {self._stats.scenes_injected} 次场景, "
+                f"活跃会话 {self._sessions.get_session_count()} 个"
+            )
 
     @filter.on_llm_request(priority=-10)
     async def on_llm_request(
@@ -517,9 +568,11 @@ class Main(star.Star):
         if not self._ensure_initialized(event):
             return
 
+        assert self._analyzer is not None
+
         umo = event.unified_msg_origin
         if not self._sessions.has_session(umo):
-            msg = self._analyzer.extract_message(event)  # type: ignore
+            msg = self._analyzer.extract_message(event)
             self._sessions.add_message(umo, msg)
 
         try:
@@ -528,7 +581,7 @@ class Main(star.Star):
                 return
 
             current = state.messages[-1]
-            trigger_type, trigger_desc = self._analyzer.detect_trigger(event, current)  # type: ignore
+            trigger_type, trigger_desc = self._analyzer.detect_trigger(event, current)
 
             window = int(self._cfg("dialogue_window", 8) or 8)
             flow = state.messages[-window:]
@@ -555,13 +608,33 @@ class Main(star.Star):
                 show_flow=bool(self._cfg("enable_dialogue_flow", True)),
             )
 
-            req.extra_user_content_parts.append(TextPart(text=scene))
+            # 注入场景描述到请求
+            # 优先使用 extra_user_content_parts，如果不存在则回退到 system_prompt
+            try:
+                if hasattr(req, 'extra_user_content_parts') and req.extra_user_content_parts is not None:
+                    req.extra_user_content_parts.append(TextPart(text=scene))
+                else:
+                    # 回退方案：添加到 system_prompt
+                    req.system_prompt = (req.system_prompt or "") + "\n\n" + scene
+            except AttributeError:
+                # 兼容旧版本 AstrBot
+                req.system_prompt = (req.system_prompt or "") + "\n\n" + scene
 
-            # 额外日志，方便调试
-            if trigger_type == TRIGGER_ACTIVE:
-                logger.debug(
-                    f"[ContextAware] 主动触发: {current.sender_name} → {current.talking_to_name}"
-                )
+            self._stats.scenes_injected += 1
+            self._stats.record_trigger(trigger_type)
+
+            # 关键日志：每次场景注入都输出
+            trigger_name = TRIGGER_NAMES.get(trigger_type, trigger_type)
+            talking_to_display = (
+                "Bot" if current.talking_to == "bot"
+                else ("群聊" if current.talking_to == "group" else current.talking_to_name)
+            )
+            logger.info(
+                f"[ContextAware] ✓ 场景注入 #{self._stats.scenes_injected} | "
+                f"触发: {trigger_name} | "
+                f"{current.sender_name} → {talking_to_display} | "
+                f"历史: {len(flow)} 条"
+            )
 
         except Exception as e:
             logger.error(f"[ContextAware] 场景分析失败: {e}")
@@ -594,7 +667,23 @@ class Main(star.Star):
             is_bot=True,
         )
         self._sessions.add_message(umo, bot_msg)
+        self._stats.bot_responses_recorded += 1
+
+        logger.debug(
+            f"[ContextAware] Bot 回复已记录 (共 {self._stats.bot_responses_recorded} 次)"
+        )
 
     async def terminate(self) -> None:
         """清理资源"""
-        logger.info("[ContextAware] 插件已终止")
+        # 输出最终统计
+        trigger_summary = ", ".join(
+            f"{TRIGGER_NAMES.get(k, k)}: {v}"
+            for k, v in sorted(self._stats.trigger_counts.items(), key=lambda x: -x[1])
+        )
+        logger.info(
+            f"[ContextAware] 插件已终止 | "
+            f"统计: 消息 {self._stats.messages_recorded}, "
+            f"场景注入 {self._stats.scenes_injected}, "
+            f"Bot回复 {self._stats.bot_responses_recorded} | "
+            f"触发类型: {trigger_summary or '无'}"
+        )
