@@ -1,5 +1,5 @@
 """
-AstrBot 上下文场景感知增强插件 v2.2.0 (Context-Aware Enhancement)
+AstrBot 上下文场景感知增强插件 v2.3.0 (Context-Aware Enhancement)
 
 为 LLM 提供结构化的群聊场景描述，增强其对对话情境的理解能力。
 重点解决：主动回复时 Bot 误以为别人在问自己的问题。
@@ -16,13 +16,14 @@ AstrBot 上下文场景感知增强插件 v2.2.0 (Context-Aware Enhancement)
 - 与框架 LongTermMemory 协作而非冲突
 - 轻量高效，不影响响应速度
 
-v2.2.0 更新:
-- 增强日志输出，可清晰观测插件工作状态
-- 添加统计信息追踪
-- 修复类型安全问题
+v2.3.0 更新:
+- 修复回复词推断误判：现在只有当 Bot 之前确实在回复当前用户时，才会推断用户在回复 Bot
+- 增加 Bot 回复对象追踪：记录 Bot 每次回复的目标用户
+- 优化 TRIGGER_UNKNOWN 处理：未知触发时采用更保守的策略
+- 收紧上下文推断条件：减少误判风险
 
 Author: 木有知
-Version: 2.2.0
+Version: 2.3.0
 """
 
 from __future__ import annotations
@@ -104,6 +105,8 @@ class SessionState:
     messages: list[MessageRecord] = field(default_factory=list)
     bot_last_spoke_at: float = 0.0
     bot_last_content: str = ""
+    bot_last_replied_to: str = ""  # Bot 上次回复的对象 ID
+    bot_last_replied_to_name: str = ""  # Bot 上次回复的对象名称
 
 
 @dataclass
@@ -154,11 +157,20 @@ class SessionManager:
         if len(state.messages) > self._max_messages:
             state.messages = state.messages[-self._max_messages:]
 
-    def record_bot_response(self, session_id: str, content: str, ts: float) -> None:
+    def record_bot_response(
+        self,
+        session_id: str,
+        content: str,
+        ts: float,
+        replied_to_id: str = "",
+        replied_to_name: str = "",
+    ) -> None:
         """记录 Bot 回复"""
         state = self.get(session_id)
         state.bot_last_spoke_at = ts
         state.bot_last_content = content[:100] if content else ""
+        state.bot_last_replied_to = replied_to_id
+        state.bot_last_replied_to_name = replied_to_name
 
     def has_session(self, session_id: str) -> bool:
         """检查会话是否存在"""
@@ -257,21 +269,32 @@ class SceneAnalyzer:
 
         return TRIGGER_UNKNOWN, "触发原因未知"
 
-    def infer_addressee(self, msg: MessageRecord, history: list[MessageRecord]) -> None:
-        """推断消息的对话对象"""
-        # 规则1: @ Bot
+    def infer_addressee(
+        self,
+        msg: MessageRecord,
+        history: list[MessageRecord],
+        bot_replied_to: str = "",
+        bot_replied_to_name: str = "",
+    ) -> None:
+        """
+        推断消息的对话对象
+        
+        核心原则：宁可保守（判定为群聊），不可激进（误判为和Bot说话）
+        只有高置信度时才判定 talking_to = "bot"
+        """
+        # ===== 规则1: 明确的 @ Bot（高置信度）=====
         if msg.at_bot:
             msg.talking_to, msg.talking_to_name = "bot", "你"
             return
 
-        # 规则2: @ 其他人
+        # ===== 规则2: @ 其他人（高置信度）=====
         if msg.at_targets:
             target_id, target_name = msg.at_targets[0]
             if target_id != self._bot_id:
                 msg.talking_to, msg.talking_to_name = target_id, target_name
                 return
 
-        # 规则3: 回复消息
+        # ===== 规则3: 引用回复消息（高置信度）=====
         if msg.reply_to_id:
             if msg.reply_to_id == self._bot_id:
                 msg.talking_to, msg.talking_to_name = "bot", "你"
@@ -285,8 +308,9 @@ class SceneAnalyzer:
                     msg.talking_to_name = msg.reply_to_id
             return
 
-        # 规则4: 上下文推断
+        # ===== 以下是上下文推断，需要更保守 =====
         if not history:
+            # 没有历史，保持默认 "group"
             return
 
         recent = [m for m in history[-5:] if m.sender_id != msg.sender_id]
@@ -296,20 +320,35 @@ class SceneAnalyzer:
         last = recent[-1]
         time_gap = msg.timestamp - last.timestamp
 
-        # Bot 刚说完话且用户像是在回复
-        if last.is_bot and time_gap < 60:
-            if self._looks_like_reply(msg.content):
-                msg.talking_to, msg.talking_to_name = "bot", "你"
-                return
-
-        # A-B-A 对话模式
-        if last.talking_to == msg.sender_id:
-            msg.talking_to, msg.talking_to_name = last.sender_id, last.sender_name
+        # ===== 规则4: Bot 刚回复过当前用户，且用户像在回应（中置信度）=====
+        # 关键修复：必须是 Bot 之前在回复"当前这个用户"，才能推断用户在回复 Bot
+        if last.is_bot and time_gap < 45:
+            # 检查 Bot 上次是否在回复当前发言者
+            if bot_replied_to == msg.sender_id:
+                if self._looks_like_reply(msg.content):
+                    msg.talking_to, msg.talking_to_name = "bot", "你"
+                    return
+            # 如果 Bot 不是在回复这个人，则这个人的"谢谢"大概率不是对 Bot 说的
+            # 保持 talking_to = "group"
             return
 
-        # 时间间隔很短，可能是在和上一个人对话
-        if time_gap < 30 and not last.is_bot:
-            msg.talking_to, msg.talking_to_name = last.sender_id, last.sender_name
+        # ===== 规则5: A-B-A 对话模式（低置信度，需要更多条件）=====
+        # 只有当上一条消息明确是对当前用户说的，才推断当前用户在回复
+        if last.talking_to == msg.sender_id and time_gap < 60:
+            # 额外检查：上一条不是 Bot 发的（Bot 场景已在规则4处理）
+            if not last.is_bot:
+                msg.talking_to, msg.talking_to_name = last.sender_id, last.sender_name
+                return
+
+        # ===== 规则6: 快速连续对话（最低置信度，收紧条件）=====
+        # 只有非常短的时间间隔 + 非 Bot 消息 + 上一条是对群说的，才推断是延续对话
+        if time_gap < 15 and not last.is_bot:
+            # 如果上一条是某人对群说的，当前消息可能是在回应那个人
+            if last.talking_to == "group":
+                msg.talking_to, msg.talking_to_name = last.sender_id, last.sender_name
+                return
+        
+        # 默认：保持 talking_to = "group"，表示无法确定具体对话对象
 
     @staticmethod
     def _looks_like_reply(content: str) -> bool:
@@ -420,31 +459,60 @@ class SceneGenerator:
     ) -> str:
         """
         生成行为指导 - 这是解决"误以为在问自己"问题的关键
+        
+        核心原则：
+        - 明确触发（@、回复、唤醒词、私聊）→ 正常回应
+        - 主动触发 → 必须明确告知 Bot 它是主动插入的
+        - 未知触发 → 最保守处理
         """
-        # 被明确呼叫的情况 - 正常回复
+        # ===== 被明确呼叫 - 正常回复 =====
         if trigger in (TRIGGER_AT, TRIGGER_REPLY, TRIGGER_WAKE, TRIGGER_PRIVATE):
             return "用户在和你对话，请正常回应。"
 
         if trigger == TRIGGER_MENTION:
             return "用户提到了你，可以适当回应。"
 
-        # 主动回复或未知触发 - 需要特别小心
-        if trigger in (TRIGGER_ACTIVE, TRIGGER_UNKNOWN):
+        # ===== 主动触发 - 需要特别小心 =====
+        if trigger == TRIGGER_ACTIVE:
             if is_talking_to_bot:
-                return "虽然是主动触发，但用户似乎在和你说话，可以回应。"
+                # 即使推断用户在和 Bot 说话，也要提醒这是主动触发
+                return (
+                    "你是主动加入对话的。根据上下文分析，用户可能在回应你之前的消息。"
+                    "请谨慎判断，如果不确定，宁可保持观望。"
+                )
 
             if is_talking_to_group:
                 return (
-                    "【注意】这条消息是说给群里的，不是在问你。"
-                    "你是主动加入对话的，请不要把这当作向你提问。"
-                    "可以选择：1)发表自己的看法 2)补充相关信息 3)适当保持沉默。"
+                    "【注意】你是主动加入对话的，这条消息是说给群里的，不是在问你。"
+                    "不要把这当作向你提问。"
+                    "合适的做法：1)发表自己的看法 2)补充相关信息 3)保持沉默。"
                 )
 
-            # 最关键的情况：A 在和 B 说话，Bot 主动插话
+            # A 在和 B 说话，Bot 主动插话
             return (
-                f"【重要】{msg.sender_name} 正在和 {msg.talking_to_name} 对话，不是在问你！"
-                f"你是主动加入的，不要把别人的问题当成问你的。"
+                f"【重要】你是主动加入对话的！{msg.sender_name} 正在和 {msg.talking_to_name} 对话，不是在问你。"
+                f"不要把别人的对话当成问你的。"
                 f"合适的做法：1)以旁观者身份补充 2)等待被问到再回答 3)保持沉默。"
+            )
+
+        # ===== 未知触发 - 最保守处理 =====
+        if trigger == TRIGGER_UNKNOWN:
+            # 触发原因未知时，无论推断结果如何，都要非常保守
+            if is_talking_to_bot:
+                return (
+                    "【谨慎】触发原因不明确。虽然上下文分析显示用户可能在和你说话，"
+                    "但请仔细判断这是否真的是对你说的。如果不确定，请保持沉默或简短回应。"
+                )
+            
+            if is_talking_to_group:
+                return (
+                    "【注意】触发原因不明确，这条消息是说给群里的。"
+                    "在不确定的情况下，建议保持沉默或仅在有价值时简短补充。"
+                )
+            
+            return (
+                f"【注意】触发原因不明确。{msg.sender_name} 似乎在和 {msg.talking_to_name} 对话。"
+                f"在不确定的情况下，建议保持沉默，避免误入他人对话。"
             )
 
         return ""
@@ -486,7 +554,7 @@ class Main(star.Star):
         self._bot_id: str | None = None
         self._analyzer: SceneAnalyzer | None = None
 
-        logger.info("[ContextAware] 插件 v2.2.0 已加载，增强日志已启用")
+        logger.info("[ContextAware] 插件 v2.3.0 已加载，增强日志已启用")
 
     def _cfg(self, key: str, default: Any = None) -> Any:
         """获取配置项"""
@@ -544,7 +612,12 @@ class Main(star.Star):
 
         msg = self._analyzer.extract_message(event)
         state = self._sessions.get(event.unified_msg_origin)
-        self._analyzer.infer_addressee(msg, state.messages)
+        self._analyzer.infer_addressee(
+            msg,
+            state.messages,
+            bot_replied_to=state.bot_last_replied_to,
+            bot_replied_to_name=state.bot_last_replied_to_name,
+        )
 
         self._sessions.add_message(event.unified_msg_origin, msg)
         self._stats.messages_recorded += 1
@@ -655,8 +728,18 @@ class Main(star.Star):
 
         now = time.time()
         umo = event.unified_msg_origin
+        
+        # 获取当前消息的发送者（Bot 正在回复的人）
+        sender_id = event.get_sender_id()
+        sender_name = event.get_sender_name() or sender_id
 
-        self._sessions.record_bot_response(umo, resp.completion_text, now)
+        self._sessions.record_bot_response(
+            umo,
+            resp.completion_text,
+            now,
+            replied_to_id=sender_id,
+            replied_to_name=sender_name,
+        )
 
         bot_msg = MessageRecord(
             msg_id=f"bot_{now}",
@@ -665,12 +748,14 @@ class Main(star.Star):
             content=resp.completion_text[:200],
             timestamp=now,
             is_bot=True,
+            talking_to=sender_id,  # 记录 Bot 在回复谁
+            talking_to_name=sender_name,
         )
         self._sessions.add_message(umo, bot_msg)
         self._stats.bot_responses_recorded += 1
 
         logger.debug(
-            f"[ContextAware] Bot 回复已记录 (共 {self._stats.bot_responses_recorded} 次)"
+            f"[ContextAware] Bot 回复已记录 (回复给: {sender_name}, 共 {self._stats.bot_responses_recorded} 次)"
         )
 
     async def terminate(self) -> None:
