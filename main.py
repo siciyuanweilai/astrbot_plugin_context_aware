@@ -1,11 +1,11 @@
 """
-AstrBot 上下文场景感知增强插件 v2.4.0 (Context-Aware Enhancement)
+AstrBot 上下文场景感知增强插件 v2.5.0 (Context-Aware Enhancement)
 
 为 LLM 提供结构化的群聊场景描述，增强其对对话情境的理解能力。
 重点解决：主动回复时 Bot 误以为别人在问自己的问题。
 
 核心功能:
-- 触发类型检测: 被@、被回复、唤醒词、主动搭话
+- 触发类型检测: 被@、被回复、唤醒词、主动搭话、戳一戳
 - 对话对象推断: 谁在和谁说话（关键功能）
 - 对话流分析: 最近的对话结构
 - Bot 状态追踪: 上次发言时间和内容
@@ -15,6 +15,11 @@ AstrBot 上下文场景感知增强插件 v2.4.0 (Context-Aware Enhancement)
 - 只做加法，不修改框架原有信息
 - 可完全替代框架内置 LTM 的群聊记录功能
 - 轻量高效，图像转述为可选功能
+
+v2.5.0 更新:
+- 新增戳一戳触发类型（TRIGGER_POKE）
+- 支持 poke_to_llm 插件的 _poke_trigger 标记
+- 戳一戳时正确显示戳一戳用户信息，而非群里最后一条消息
 
 v2.4.0 更新:
 - 新增图像转述功能：可将群友发送的图片转为文字描述
@@ -28,7 +33,7 @@ v2.3.0 更新:
 - 收紧上下文推断条件：减少误判风险
 
 Author: 木有知
-Version: 2.4.0
+Version: 2.5.0
 """
 
 from __future__ import annotations
@@ -60,6 +65,7 @@ TRIGGER_REPLY: Final = "reply_to_bot"
 TRIGGER_WAKE: Final = "wake_word"
 TRIGGER_MENTION: Final = "mention"
 TRIGGER_ACTIVE: Final = "active"
+TRIGGER_POKE: Final = "poke"
 TRIGGER_UNKNOWN: Final = "unknown"
 
 # 触发类型中文名（用于日志）
@@ -70,6 +76,7 @@ TRIGGER_NAMES: Final = {
     TRIGGER_WAKE: "唤醒词",
     TRIGGER_MENTION: "提及Bot",
     TRIGGER_ACTIVE: "主动触发",
+    TRIGGER_POKE: "戳一戳",
     TRIGGER_UNKNOWN: "未知",
 }
 
@@ -250,6 +257,11 @@ class SceneAnalyzer:
     ) -> tuple[str, str]:
         """检测触发类型"""
         sender = msg.sender_name
+
+        # 检查是否为戳一戳触发（由 poke_to_llm 插件设置）
+        if event.get_extra("_poke_trigger"):
+            poke_sender_name = event.get_extra("_poke_sender_name") or sender
+            return TRIGGER_POKE, f"{poke_sender_name} 戳了戳你，可能想让你回应之前的内容或想和你聊天"
 
         if event.is_private_chat():
             return TRIGGER_PRIVATE, f"私聊对话，{sender} 在直接和你交流"
@@ -466,13 +478,21 @@ class SceneGenerator:
         生成行为指导 - 这是解决"误以为在问自己"问题的关键
         
         核心原则：
-        - 明确触发（@、回复、唤醒词、私聊）→ 正常回应
+        - 明确触发（@、回复、唤醒词、私聊、戳一戳）→ 正常回应
         - 主动触发 → 必须明确告知 Bot 它是主动插入的
         - 未知触发 → 最保守处理
         """
         # ===== 被明确呼叫 - 正常回复 =====
         if trigger in (TRIGGER_AT, TRIGGER_REPLY, TRIGGER_WAKE, TRIGGER_PRIVATE):
             return "用户在和你对话，请正常回应。"
+
+        # ===== 戳一戳触发 - 用户主动找你 =====
+        if trigger == TRIGGER_POKE:
+            return (
+                "用户戳了戳你，表示想和你互动。"
+                "请根据最近的对话上下文判断用户意图：可能是忘了@你、想聊天、希望你回答问题、或只是戳着玩。"
+                "自然地回应，如果上下文有明确话题就回应话题，没有就俏皮地回应戳一戳。"
+            )
 
         if trigger == TRIGGER_MENTION:
             return "用户提到了你，可以适当回应。"
@@ -571,7 +591,7 @@ class Main(star.Star):
         self._image_caption_count = 0
         self._image_caption_errors = 0
 
-        version = "2.4.0"
+        version = "2.5.0"
         caption_status = "已启用" if self._image_caption_enabled else "未启用"
         logger.info(f"[ContextAware] 插件 v{version} 已加载 | 图像转述: {caption_status}")
 
@@ -772,7 +792,26 @@ class Main(star.Star):
             if not state.messages:
                 return
 
-            current = state.messages[-1]
+            # 检查是否为戳一戳触发
+            is_poke_trigger = bool(event.get_extra("_poke_trigger"))
+            
+            if is_poke_trigger:
+                # 戳一戳触发时，创建虚拟的 current 消息表示戳一戳用户
+                poke_sender_id = event.get_extra("_poke_sender_id") or event.get_sender_id()
+                poke_sender_name = event.get_extra("_poke_sender_name") or event.get_sender_name() or poke_sender_id
+                current = MessageRecord(
+                    msg_id=f"poke_{time.time()}",
+                    sender_id=str(poke_sender_id),
+                    sender_name=str(poke_sender_name),
+                    content=f"[戳了戳你]",
+                    timestamp=time.time(),
+                    is_bot=False,
+                    talking_to="bot",
+                    talking_to_name="你",
+                )
+            else:
+                current = state.messages[-1]
+                
             trigger_type, trigger_desc = self._analyzer.detect_trigger(event, current)
 
             window = int(self._cfg("dialogue_window", 8) or 8)
