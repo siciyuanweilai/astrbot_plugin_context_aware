@@ -35,6 +35,18 @@
     "type": "bool",
     "default": true
   },
+  "debug_inference": {
+    "description": "启用推断规则调试日志",
+    "type": "bool",
+    "default": false,
+    "hint": "启用后会在日志中输出每条消息的对话对象推断过程"
+  },
+  "reply_starters": {
+    "description": "回复特征词（用于判断用户是否在回复Bot）",
+    "type": "list",
+    "default": [],
+    "hint": "留空使用默认词库。例如: 好的, 谢谢, 明白了"
+  },
   "image_caption": {
     "description": "启用图像转述（将群友发的图片转为文字描述）",
     "type": "bool",

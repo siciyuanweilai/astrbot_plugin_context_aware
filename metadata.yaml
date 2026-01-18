@@ -12,6 +12,18 @@ help: |
   - Bot状态：上次发言时间
   - 图像转述：可选功能，将群友发送的图片转为文字描述
 
+  v3.0.0 重大更新（精品重构）：
+  - [CRITICAL] 修复并发竞态：SessionManager 添加异步锁 + deque 自动裁剪
+  - [HIGH] 图像转述优化：并发限流(Semaphore) + 超时控制 + URL缓存
+  - [HIGH] 修复封装破坏：SceneAnalyzer 添加 bot_id 只读属性
+  - [HIGH] 消除魔法字符串：集中定义 ExtraKeys 常量类
+  - [HIGH] 安全注入场景：防止重复注入 + 兼容处理
+  - [HIGH] 对话推断增强：关键锚点分离 + 推断原因追踪
+  - [MEDIUM] 配置工具方法：_cfg_int/_cfg_bool/_cfg_list
+  - [MEDIUM] 回复特征词可配置化
+  - [MEDIUM] 增强可观测性：推断规则调试日志
+  - [LOW] 修复时间戳精度：使用 uuid
+
   v2.5.1 更新：
   - 新增公开 API：remove_message() 和 remove_last_bot_response()
   - 支持 recall_cancel 插件联动清理撤回消息的上下文记录
@@ -35,8 +47,9 @@ help: |
   - 可完全替代框架内置 LTM 的群聊记录功能
   - 只做加法，不修改框架原有信息
   - 轻量快速，图像转述为可选功能
+  - v3.0.0: 并发安全、高性能、可观测
 
   配置说明请查看插件配置页面。
-version: 2.5.3
+version: 3.0.0
 author: 木有知
 repo: https://github.com/muyouzhi6/astrbot_plugin_context_aware

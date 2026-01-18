@@ -1,5 +1,5 @@
 """
-AstrBot 上下文场景感知增强插件 v2.5.0 (Context-Aware Enhancement)
+AstrBot 上下文场景感知增强插件 v3.0.0 (Context-Aware Enhancement)
 
 为 LLM 提供结构化的群聊场景描述，增强其对对话情境的理解能力。
 重点解决：主动回复时 Bot 误以为别人在问自己的问题。
@@ -16,32 +16,35 @@ AstrBot 上下文场景感知增强插件 v2.5.0 (Context-Aware Enhancement)
 - 可完全替代框架内置 LTM 的群聊记录功能
 - 轻量高效，图像转述为可选功能
 
-v2.5.0 更新:
+v3.0.0 更新 (重大重构):
+- [CRITICAL] 修复并发竞态: SessionManager 添加异步锁 + deque 替代 list
+- [HIGH] 图像转述优化: 并发限流(Semaphore) + 超时控制 + URL缓存
+- [HIGH] 修复封装破坏: SceneAnalyzer 添加 bot_id 只读属性
+- [HIGH] 消除魔法字符串: 集中定义 ExtraKeys 常量类
+- [HIGH] 安全注入场景: 防止重复注入 + 兼容处理
+- [HIGH] 对话推断增强: 关键锚点分离 + 推断原因追踪
+- [MEDIUM] 配置工具方法: _cfg_int/_cfg_bool/_cfg_list
+- [MEDIUM] 回复特征词可配置化
+- [MEDIUM] 增强可观测性: 推断规则日志
+- [LOW] 修复时间戳精度: 使用 uuid
+
+v2.5.1 更新:
 - 新增戳一戳触发类型（TRIGGER_POKE）
 - 支持 poke_to_llm 插件的 _poke_trigger 标记
-- 戳一戳时正确显示戳一戳用户信息，而非群里最后一条消息
-
-v2.4.0 更新:
-- 新增图像转述功能：可将群友发送的图片转为文字描述
-- 支持自定义图像转述提供商和提示词
-- 完善文档：明确说明需关闭框架内置 LTM 以避免重复
-
-v2.3.0 更新:
-- 修复回复词推断误判：现在只有当 Bot 之前确实在回复当前用户时，才会推断用户在回复 Bot
-- 增加 Bot 回复对象追踪：记录 Bot 每次回复的目标用户
-- 优化 TRIGGER_UNKNOWN 处理：未知触发时采用更保守的策略
-- 收紧上下文推断条件：减少误判风险
+- 戳一戳时正确显示戳一戳用户信息
 
 Author: 木有知
-Version: 2.5.1
+Version: 3.0.0
 """
 
 from __future__ import annotations
 
+import asyncio
 import time
-from collections import OrderedDict
+import uuid
+from collections import OrderedDict, deque
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Final
+from typing import TYPE_CHECKING, Any, Final, final
 
 from astrbot import logger
 from astrbot.api import star
@@ -52,6 +55,25 @@ from astrbot.core.agent.message import TextPart
 
 if TYPE_CHECKING:
     from astrbot.core.config import AstrBotConfig
+
+
+# ============================================================================
+# Extra Keys - 消除魔法字符串
+# ============================================================================
+
+
+@final
+class ExtraKeys:
+    """框架 extra 字段键名常量，集中管理避免魔法字符串"""
+    
+    POKE_TRIGGER: Final[str] = "_poke_trigger"
+    POKE_SENDER_ID: Final[str] = "_poke_sender_id"
+    POKE_SENDER_NAME: Final[str] = "_poke_sender_name"
+    ACTIVE_TRIGGER: Final[str] = "_active_trigger"
+    ACTIVE_REPLY_TRIGGERED: Final[str] = "active_reply_triggered"
+    
+    # 场景注入标记，防止重复注入
+    SCENE_INJECTED_MARKER: Final[str] = "<!-- context_aware_scene_v3 -->"
 
 
 # ============================================================================
@@ -80,12 +102,30 @@ TRIGGER_NAMES: Final = {
     TRIGGER_UNKNOWN: "未知",
 }
 
-# 回复特征词（用于判断是否在回复 Bot）
-REPLY_STARTERS: Final = frozenset({
+# 回复特征词（用于判断是否在回复 Bot）- 可通过配置覆盖
+DEFAULT_REPLY_STARTERS: Final = frozenset({
     "好的", "好", "嗯", "是的", "对", "谢谢", "感谢", "收到",
     "明白", "知道了", "了解", "可以", "行", "没问题",
     "ok", "OK", "Ok", "好滴", "好哒", "好嘞", "okok",
 })
+
+
+# ============================================================================
+# Inference Reasons - 推断原因追踪
+# ============================================================================
+
+
+@final
+class InferenceReason:
+    """对话对象推断原因常量"""
+    
+    RULE_1_AT_BOT: Final[str] = "rule_1_at_bot"           # 明确 @Bot
+    RULE_2_AT_OTHER: Final[str] = "rule_2_at_other"       # @其他人
+    RULE_3_REPLY: Final[str] = "rule_3_reply"             # 引用回复
+    RULE_4_BOT_REPLIED: Final[str] = "rule_4_bot_replied" # Bot 刚回复过此人
+    RULE_5_ABA_PATTERN: Final[str] = "rule_5_aba_pattern" # A-B-A 对话模式
+    RULE_6_QUICK_FOLLOW: Final[str] = "rule_6_quick_follow"  # 快速连续对话
+    DEFAULT_GROUP: Final[str] = "default_group"           # 默认群聊
 
 
 # ============================================================================
@@ -112,13 +152,18 @@ class MessageRecord:
 
 @dataclass(slots=True)
 class SessionState:
-    """会话状态 - 每个群聊/私聊一个"""
+    """会话状态 - 每个群聊/私聊一个
+    
+    v3.0.0: 使用 deque 替代 list，避免手动裁剪的非原子操作
+    """
 
-    messages: list[MessageRecord] = field(default_factory=list)
+    messages: deque[MessageRecord] = field(default_factory=lambda: deque(maxlen=50))
     bot_last_spoke_at: float = 0.0
     bot_last_content: str = ""
     bot_last_replied_to: str = ""  # Bot 上次回复的对象 ID
     bot_last_replied_to_name: str = ""  # Bot 上次回复的对象名称
+    # v3.0.0: 关键锚点分离，不随消息淘汰
+    last_user_interaction: dict[str, float] = field(default_factory=dict)  # user_id -> timestamp
 
 
 @dataclass
@@ -140,34 +185,110 @@ class PluginStats:
 
 
 class SessionManager:
-    """会话管理器 - 带 LRU 淘汰机制"""
+    """会话管理器 - 带 LRU 淘汰机制和异步锁保护
+    
+    v3.0.0 重构:
+    - 添加 asyncio.Lock 防止并发竞态
+    - 使用 deque 自动裁剪，避免非原子操作
+    - 淘汰会话时同时清理关联的锁
+    
+    v3.0.1 增强:
+    - 添加缓存级别锁保护 LRU 的 move_to_end/popitem
+    - 废弃同步写方法的直接使用（保留向后兼容但加警告）
+    
+    并发模型说明:
+    - _cache_lock: 保护 _sessions (OrderedDict) 和 _locks (dict) 的结构性修改
+    - 每会话锁: 保护单个会话的 messages/state 修改
+    - 所有写操作应使用 async 版本
+    """
 
-    __slots__ = ("_sessions", "_max_messages", "_max_sessions")
+    __slots__ = ("_sessions", "_locks", "_max_messages", "_max_sessions", "_cache_lock")
 
     def __init__(self, max_messages: int = 50, max_sessions: int = 100) -> None:
         self._sessions: OrderedDict[str, SessionState] = OrderedDict()
+        self._locks: dict[str, asyncio.Lock] = {}
+        self._cache_lock = asyncio.Lock()  # 缓存级别锁，保护 LRU 操作
         self._max_messages = max(10, max_messages)
         self._max_sessions = max(10, max_sessions)
 
+    def _get_lock(self, session_id: str) -> asyncio.Lock:
+        """获取会话锁（惰性创建，使用 setdefault 保证原子性）"""
+        # setdefault 是原子操作，避免竞态条件
+        return self._locks.setdefault(session_id, asyncio.Lock())
+
+    async def _get_or_create_session(self, session_id: str) -> SessionState:
+        """获取或创建会话状态（异步，带缓存锁保护）
+        
+        这是并发安全的核心方法，保护 LRU 的 move_to_end 和 popitem。
+        """
+        async with self._cache_lock:
+            if session_id in self._sessions:
+                self._sessions.move_to_end(session_id)
+                return self._sessions[session_id]
+
+            while len(self._sessions) >= self._max_sessions:
+                evicted_id, _ = self._sessions.popitem(last=False)
+                # 清理关联的锁
+                self._locks.pop(evicted_id, None)
+
+            # 创建新会话时设置 deque 的 maxlen
+            state = SessionState()
+            state.messages = deque(maxlen=self._max_messages)
+            self._sessions[session_id] = state
+            return state
+
     def get(self, session_id: str) -> SessionState:
-        """获取或创建会话状态"""
+        """获取或创建会话状态（同步方法，用于读取）
+        
+        警告：此方法在并发场景下可能存在竞态。
+        推荐在异步上下文中使用 _get_or_create_session()。
+        """
         if session_id in self._sessions:
             self._sessions.move_to_end(session_id)
             return self._sessions[session_id]
 
         while len(self._sessions) >= self._max_sessions:
-            self._sessions.popitem(last=False)
+            evicted_id, _ = self._sessions.popitem(last=False)
+            self._locks.pop(evicted_id, None)
 
         state = SessionState()
+        state.messages = deque(maxlen=self._max_messages)
         self._sessions[session_id] = state
         return state
 
+    async def add_message_async(self, session_id: str, msg: MessageRecord) -> None:
+        """异步添加消息到会话（推荐使用，完全并发安全）"""
+        async with self._get_lock(session_id):
+            state = await self._get_or_create_session(session_id)
+            state.messages.append(msg)
+            if not msg.is_bot:
+                state.last_user_interaction[msg.sender_id] = msg.timestamp
+
     def add_message(self, session_id: str, msg: MessageRecord) -> None:
-        """添加消息到会话"""
+        """同步添加消息（向后兼容，但不推荐在并发场景使用）
+        
+        注意：此方法不提供完整的并发保护，仅用于向后兼容。
+        """
         state = self.get(session_id)
         state.messages.append(msg)
-        if len(state.messages) > self._max_messages:
-            state.messages = state.messages[-self._max_messages:]
+        if not msg.is_bot:
+            state.last_user_interaction[msg.sender_id] = msg.timestamp
+
+    async def record_bot_response_async(
+        self,
+        session_id: str,
+        content: str,
+        ts: float,
+        replied_to_id: str = "",
+        replied_to_name: str = "",
+    ) -> None:
+        """异步记录 Bot 回复（推荐使用，完全并发安全）"""
+        async with self._get_lock(session_id):
+            state = await self._get_or_create_session(session_id)
+            state.bot_last_spoke_at = ts
+            state.bot_last_content = content[:100] if content else ""
+            state.bot_last_replied_to = replied_to_id
+            state.bot_last_replied_to_name = replied_to_name
 
     def record_bot_response(
         self,
@@ -177,7 +298,7 @@ class SessionManager:
         replied_to_id: str = "",
         replied_to_name: str = "",
     ) -> None:
-        """记录 Bot 回复"""
+        """同步记录 Bot 回复（向后兼容）"""
         state = self.get(session_id)
         state.bot_last_spoke_at = ts
         state.bot_last_content = content[:100] if content else ""
@@ -198,39 +319,67 @@ class SessionManager:
             return len(self._sessions[session_id].messages)
         return 0
 
-    def remove_message_by_id(self, session_id: str, msg_id: str) -> bool:
-        """根据消息ID删除指定消息
+    def get_messages_list(self, session_id: str) -> list[MessageRecord]:
+        """获取消息列表（将 deque 转为 list，统一入口避免到处转换）"""
+        if session_id in self._sessions:
+            return list(self._sessions[session_id].messages)
+        return []
+
+    async def remove_message_by_id_async(self, session_id: str, msg_id: str) -> bool:
+        """异步删除指定消息（带锁保护）
         
         供 recall_cancel 等插件调用，在消息撤回时清理记录。
-        
-        Args:
-            session_id: 会话标识 (unified_msg_origin)
-            msg_id: 要删除的消息ID
-            
-        Returns:
-            是否成功删除
         """
+        async with self._get_lock(session_id):
+            if session_id not in self._sessions:
+                return False
+            
+            state = self._sessions[session_id]
+            original_count = len(state.messages)
+            new_messages: deque[MessageRecord] = deque(
+                (m for m in state.messages if m.msg_id != msg_id),
+                maxlen=state.messages.maxlen
+            )
+            state.messages = new_messages
+            
+            return original_count - len(state.messages) > 0
+
+    def remove_message_by_id(self, session_id: str, msg_id: str) -> bool:
+        """同步删除指定消息（向后兼容）"""
         if session_id not in self._sessions:
             return False
         
         state = self._sessions[session_id]
         original_count = len(state.messages)
-        state.messages = [m for m in state.messages if m.msg_id != msg_id]
+        new_messages: deque[MessageRecord] = deque(
+            (m for m in state.messages if m.msg_id != msg_id),
+            maxlen=state.messages.maxlen
+        )
+        state.messages = new_messages
         
-        removed = original_count - len(state.messages)
-        return removed > 0
+        return original_count - len(state.messages) > 0
+
+    async def remove_last_bot_message_async(self, session_id: str) -> bool:
+        """异步删除最后一条 Bot 消息（带锁保护）"""
+        async with self._get_lock(session_id):
+            if session_id not in self._sessions:
+                return False
+            
+            state = self._sessions[session_id]
+            if not state.messages:
+                return False
+            
+            messages_list = list(state.messages)
+            for i in range(len(messages_list) - 1, -1, -1):
+                if messages_list[i].is_bot:
+                    del messages_list[i]
+                    state.messages = deque(messages_list, maxlen=state.messages.maxlen)
+                    return True
+            
+            return False
 
     def remove_last_bot_message(self, session_id: str) -> bool:
-        """删除会话中最后一条 Bot 消息
-        
-        供 recall_cancel 等插件调用，在撤回时同时清理 Bot 的回复记录。
-        
-        Args:
-            session_id: 会话标识 (unified_msg_origin)
-            
-        Returns:
-            是否成功删除
-        """
+        """同步删除最后一条 Bot 消息（向后兼容）"""
         if session_id not in self._sessions:
             return False
         
@@ -238,10 +387,11 @@ class SessionManager:
         if not state.messages:
             return False
         
-        # 从后往前找最后一条 Bot 消息
-        for i in range(len(state.messages) - 1, -1, -1):
-            if state.messages[i].is_bot:
-                del state.messages[i]
+        messages_list = list(state.messages)
+        for i in range(len(messages_list) - 1, -1, -1):
+            if messages_list[i].is_bot:
+                del messages_list[i]
+                state.messages = deque(messages_list, maxlen=state.messages.maxlen)
                 return True
         
         return False
@@ -253,15 +403,29 @@ class SessionManager:
 
 
 class SceneAnalyzer:
-    """场景分析器 - 负责所有分析逻辑"""
+    """场景分析器 - 负责所有分析逻辑
+    
+    v3.0.0: 添加 bot_id 只读属性，支持自定义回复特征词
+    """
 
-    __slots__ = ("_bot_id", "_bot_names")
+    __slots__ = ("_bot_id", "_bot_names", "_reply_starters")
 
-    def __init__(self, bot_id: str, bot_names: list[str] | None = None) -> None:
+    def __init__(
+        self, 
+        bot_id: str, 
+        bot_names: list[str] | None = None,
+        reply_starters: frozenset[str] | None = None,
+    ) -> None:
         self._bot_id = bot_id
         self._bot_names: tuple[str, ...] = tuple(
             n.lower() for n in (bot_names or []) if n
         )
+        self._reply_starters = reply_starters or DEFAULT_REPLY_STARTERS
+
+    @property
+    def bot_id(self) -> str:
+        """Bot ID 只读属性（v3.0.0: 修复封装破坏）"""
+        return self._bot_id
 
     def extract_message(self, event: AstrMessageEvent) -> MessageRecord:
         """从事件提取消息记录"""
@@ -307,8 +471,8 @@ class SceneAnalyzer:
         sender = msg.sender_name
 
         # 检查是否为戳一戳触发（由 poke_to_llm 插件设置）
-        if event.get_extra("_poke_trigger"):
-            poke_sender_name = event.get_extra("_poke_sender_name") or sender
+        if event.get_extra(ExtraKeys.POKE_TRIGGER):
+            poke_sender_name = event.get_extra(ExtraKeys.POKE_SENDER_NAME) or sender
             return TRIGGER_POKE, f"{poke_sender_name} 戳了戳你，可能想让你回应之前的内容或想和你聊天"
 
         if event.is_private_chat():
@@ -329,7 +493,7 @@ class SceneAnalyzer:
                 if name in msg_lower:
                     return TRIGGER_MENTION, f"{sender} 在消息中提到了你"
 
-        if event.get_extra("_active_trigger") or event.get_extra("active_reply_triggered"):
+        if event.get_extra(ExtraKeys.ACTIVE_TRIGGER) or event.get_extra(ExtraKeys.ACTIVE_REPLY_TRIGGERED):
             return TRIGGER_ACTIVE, "你是主动加入这个对话的，没有人在叫你"
 
         return TRIGGER_UNKNOWN, "触发原因未知"
@@ -337,27 +501,32 @@ class SceneAnalyzer:
     def infer_addressee(
         self,
         msg: MessageRecord,
-        history: list[MessageRecord],
+        history: list[MessageRecord] | deque[MessageRecord],
         bot_replied_to: str = "",
         bot_replied_to_name: str = "",
-    ) -> None:
+    ) -> str:
         """
         推断消息的对话对象
         
         核心原则：宁可保守（判定为群聊），不可激进（误判为和Bot说话）
         只有高置信度时才判定 talking_to = "bot"
+        
+        v3.0.0: 返回推断原因，用于可观测性
+        
+        Returns:
+            推断原因常量 (InferenceReason.*)
         """
         # ===== 规则1: 明确的 @ Bot（高置信度）=====
         if msg.at_bot:
             msg.talking_to, msg.talking_to_name = "bot", "你"
-            return
+            return InferenceReason.RULE_1_AT_BOT
 
         # ===== 规则2: @ 其他人（高置信度）=====
         if msg.at_targets:
             target_id, target_name = msg.at_targets[0]
             if target_id != self._bot_id:
                 msg.talking_to, msg.talking_to_name = target_id, target_name
-                return
+                return InferenceReason.RULE_2_AT_OTHER
 
         # ===== 规则3: 引用回复消息（高置信度）=====
         if msg.reply_to_id:
@@ -365,22 +534,26 @@ class SceneAnalyzer:
                 msg.talking_to, msg.talking_to_name = "bot", "你"
             else:
                 msg.talking_to = msg.reply_to_id
-                for m in reversed(history):
+                # 将 deque 转为可迭代的反向列表
+                history_list = list(history) if isinstance(history, deque) else history
+                for m in reversed(history_list):
                     if m.sender_id == msg.reply_to_id:
                         msg.talking_to_name = m.sender_name
                         break
                 else:
                     msg.talking_to_name = msg.reply_to_id
-            return
+            return InferenceReason.RULE_3_REPLY
 
         # ===== 以下是上下文推断，需要更保守 =====
         if not history:
             # 没有历史，保持默认 "group"
-            return
+            return InferenceReason.DEFAULT_GROUP
 
-        recent = [m for m in history[-5:] if m.sender_id != msg.sender_id]
+        # 将 deque 转为 list 以支持切片
+        history_list = list(history) if isinstance(history, deque) else history
+        recent = [m for m in history_list[-5:] if m.sender_id != msg.sender_id]
         if not recent:
-            return
+            return InferenceReason.DEFAULT_GROUP
 
         last = recent[-1]
         time_gap = msg.timestamp - last.timestamp
@@ -392,10 +565,10 @@ class SceneAnalyzer:
             if bot_replied_to == msg.sender_id:
                 if self._looks_like_reply(msg.content):
                     msg.talking_to, msg.talking_to_name = "bot", "你"
-                    return
+                    return InferenceReason.RULE_4_BOT_REPLIED
             # 如果 Bot 不是在回复这个人，则这个人的"谢谢"大概率不是对 Bot 说的
             # 保持 talking_to = "group"
-            return
+            return InferenceReason.DEFAULT_GROUP
 
         # ===== 规则5: A-B-A 对话模式（低置信度，需要更多条件）=====
         # 只有当上一条消息明确是对当前用户说的，才推断当前用户在回复
@@ -403,7 +576,7 @@ class SceneAnalyzer:
             # 额外检查：上一条不是 Bot 发的（Bot 场景已在规则4处理）
             if not last.is_bot:
                 msg.talking_to, msg.talking_to_name = last.sender_id, last.sender_name
-                return
+                return InferenceReason.RULE_5_ABA_PATTERN
 
         # ===== 规则6: 快速连续对话（最低置信度，收紧条件）=====
         # 只有非常短的时间间隔 + 非 Bot 消息 + 上一条是对群说的，才推断是延续对话
@@ -411,15 +584,15 @@ class SceneAnalyzer:
             # 如果上一条是某人对群说的，当前消息可能是在回应那个人
             if last.talking_to == "group":
                 msg.talking_to, msg.talking_to_name = last.sender_id, last.sender_name
-                return
+                return InferenceReason.RULE_6_QUICK_FOLLOW
         
         # 默认：保持 talking_to = "group"，表示无法确定具体对话对象
+        return InferenceReason.DEFAULT_GROUP
 
-    @staticmethod
-    def _looks_like_reply(content: str) -> bool:
-        """判断是否像回复"""
+    def _looks_like_reply(self, content: str) -> bool:
+        """判断是否像回复（v3.0.0: 使用可配置的回复特征词）"""
         stripped = content.strip()
-        return any(stripped.startswith(s) for s in REPLY_STARTERS)
+        return any(stripped.startswith(s) for s in self._reply_starters)
 
 
 # ============================================================================
@@ -603,7 +776,12 @@ class Main(star.Star):
     通过分析群聊消息结构，为 LLM 提供结构化的场景描述，
     帮助 Bot 更好地理解对话情境并做出恰当回应。
 
-    v2.4.0 更新：新增图像转述功能，可完全替代框架内置 LTM。
+    v3.0.0 重大更新：
+    - 并发安全：SessionManager 添加异步锁
+    - 图像转述优化：并发限流 + 超时 + 缓存
+    - 封装修复：SceneAnalyzer 添加 bot_id 只读属性
+    - 配置工具：_cfg_int/_cfg_bool/_cfg_list
+    - 可观测性：推断规则日志
     """
 
     def __init__(
@@ -615,19 +793,25 @@ class Main(star.Star):
         self._config = config
         self._context = context  # 保存 context 用于获取 provider
 
-        self._enabled = bool(self._cfg("enable", True))
-        self._group_only = bool(self._cfg("only_group_chat", True))
+        self._enabled = self._cfg_bool("enable", True)
+        self._group_only = self._cfg_bool("only_group_chat", True)
 
         # 图像转述配置
-        self._image_caption_enabled = bool(self._cfg("image_caption", False))
+        self._image_caption_enabled = self._cfg_bool("image_caption", False)
         self._image_caption_provider_id = str(self._cfg("image_caption_provider_id", "") or "")
         self._image_caption_prompt = str(
             self._cfg("image_caption_prompt", "请用中文简洁描述这张图片的内容，不超过50字。") or ""
         )
 
+        # v3.0.0: 图像转述并发控制
+        self._image_caption_semaphore = asyncio.Semaphore(3)  # 最多并发3个
+        self._image_caption_cache: OrderedDict[str, str] = OrderedDict()  # URL -> caption (LRU)
+        self._image_caption_cache_max = 100  # 硬上限
+        self._image_caption_timeout = 15.0  # 15秒超时
+
         self._sessions = SessionManager(
-            max_messages=int(self._cfg("max_history", 50) or 50),
-            max_sessions=int(self._cfg("max_groups", 100) or 100),
+            max_messages=self._cfg_int("max_history", 50),
+            max_sessions=self._cfg_int("max_groups", 100),
         )
         self._scene_generator = SceneGenerator()
         self._stats = PluginStats()
@@ -638,8 +822,9 @@ class Main(star.Star):
         # 图像转述统计
         self._image_caption_count = 0
         self._image_caption_errors = 0
+        self._image_caption_cache_hits = 0
 
-        version = "2.5.1"
+        version = "3.0.0"
         caption_status = "已启用" if self._image_caption_enabled else "未启用"
         logger.info(f"[ContextAware] 插件 v{version} 已加载 | 图像转述: {caption_status}")
 
@@ -648,6 +833,54 @@ class Main(star.Star):
         if self._config is None:
             return default
         return self._config.get(key, default)
+
+    def _cfg_int(self, key: str, default: int) -> int:
+        """获取整数配置项（v3.0.0）"""
+        val = self._cfg(key, default)
+        if val is None:
+            return default
+        try:
+            return int(val)
+        except (TypeError, ValueError):
+            return default
+
+    def _cfg_bool(self, key: str, default: bool) -> bool:
+        """获取布尔配置项（v3.0.0）"""
+        val = self._cfg(key, default)
+        if val is None:
+            return default
+        return bool(val)
+
+    def _cfg_list(self, key: str, default: list[str] | None = None) -> list[str]:
+        """获取列表配置项（v3.0.0）"""
+        val = self._cfg(key, default or [])
+        if isinstance(val, list):
+            return [str(v) for v in val if v]
+        return default or []
+
+    def _inject_scene(self, req: ProviderRequest, scene: str) -> None:
+        """安全注入场景描述到请求（v3.0.0: 防止重复注入 + 兼容处理）"""
+        marker = ExtraKeys.SCENE_INJECTED_MARKER
+        
+        # 检查是否已注入（防止重复）
+        if hasattr(req, 'system_prompt') and req.system_prompt and marker in req.system_prompt:
+            logger.debug("[ContextAware] 场景已注入，跳过重复注入")
+            return
+        
+        # 优先使用 extra_user_content_parts
+        try:
+            extra_parts = getattr(req, 'extra_user_content_parts', None)
+            if extra_parts is not None and isinstance(extra_parts, list):
+                extra_parts.append(TextPart(text=scene))
+                return
+        except Exception:
+            pass
+        
+        # 回退方案：添加到 system_prompt（带标记）
+        try:
+            req.system_prompt = (req.system_prompt or "") + f"\n\n{marker}\n{scene}"
+        except Exception as e:
+            logger.error(f"[ContextAware] 场景注入失败: {e}")
 
     def _should_process(self, event: AstrMessageEvent) -> bool:
         """判断是否应该处理此事件"""
@@ -672,46 +905,76 @@ class Main(star.Star):
         if isinstance(bot_names_raw, list):
             bot_names = [str(n) for n in bot_names_raw if n]
 
-        self._analyzer = SceneAnalyzer(self._bot_id, bot_names)
+        # v3.0.0: 支持自定义回复特征词
+        custom_starters = self._cfg_list("reply_starters", None)
+        reply_starters = frozenset(custom_starters) if custom_starters else None
+
+        self._analyzer = SceneAnalyzer(
+            bot_id=self._bot_id, 
+            bot_names=bot_names,
+            reply_starters=reply_starters,
+        )
         logger.info(f"[ContextAware] 初始化完成，Bot ID: {self._bot_id}")
         return True
 
     async def _get_image_caption(self, image_url: str) -> str | None:
-        """获取图片描述"""
+        """获取图片描述（v3.0.0: 并发限流 + 超时 + 缓存）"""
         if not self._image_caption_enabled:
             return None
 
+        # 缓存命中检查
+        if image_url in self._image_caption_cache:
+            self._image_caption_cache_hits += 1
+            # 移动到末尾（LRU 更新）
+            self._image_caption_cache.move_to_end(image_url)
+            return self._image_caption_cache[image_url]
+
         try:
-            # 获取 provider
-            provider = None
-            if self._image_caption_provider_id:
-                provider = self._context.get_provider_by_id(self._image_caption_provider_id)
-                if not provider:
-                    logger.warning(
-                        f"[ContextAware] 找不到指定的图像转述提供商: {self._image_caption_provider_id}"
-                    )
+            # 并发限流
+            async with self._image_caption_semaphore:
+                # 获取 provider
+                provider = None
+                if self._image_caption_provider_id:
+                    provider = self._context.get_provider_by_id(self._image_caption_provider_id)
+                    if not provider:
+                        logger.warning(
+                            f"[ContextAware] 找不到指定的图像转述提供商: {self._image_caption_provider_id}"
+                        )
+                        return None
+                else:
+                    provider = self._context.get_using_provider()
+
+                if not provider or not isinstance(provider, Provider):
+                    logger.warning("[ContextAware] 无法获取有效的 Provider 进行图像转述")
                     return None
-            else:
-                provider = self._context.get_using_provider()
 
-            if not provider or not isinstance(provider, Provider):
-                logger.warning("[ContextAware] 无法获取有效的 Provider 进行图像转述")
-                return None
+                # 调用 LLM 获取图片描述（带超时）
+                try:
+                    response = await asyncio.wait_for(
+                        provider.text_chat(
+                            prompt=self._image_caption_prompt,
+                            image_urls=[image_url],
+                        ),
+                        timeout=self._image_caption_timeout
+                    )
+                except asyncio.TimeoutError:
+                    self._image_caption_errors += 1
+                    logger.warning(f"[ContextAware] 图像转述超时 ({self._image_caption_timeout}s)")
+                    return None
 
-            # 调用 LLM 获取图片描述
-            response = await provider.text_chat(
-                prompt=self._image_caption_prompt,
-                image_urls=[image_url],
-            )
-
-            if response and response.completion_text:
-                self._image_caption_count += 1
-                caption = response.completion_text.strip()
-                # 限制长度
-                if len(caption) > 100:
-                    caption = caption[:97] + "..."
-                logger.debug(f"[ContextAware] 图像转述成功: {caption[:30]}...")
-                return caption
+                if response and response.completion_text:
+                    self._image_caption_count += 1
+                    caption = response.completion_text.strip()
+                    # 限制长度
+                    if len(caption) > 100:
+                        caption = caption[:97] + "..."
+                    # 缓存结果（使用 OrderedDict 实现 LRU）
+                    self._image_caption_cache[image_url] = caption
+                    # LRU 淘汰：超过硬上限时移除最旧的
+                    while len(self._image_caption_cache) > self._image_caption_cache_max:
+                        self._image_caption_cache.popitem(last=False)
+                    logger.debug(f"[ContextAware] 图像转述成功: {caption[:30]}...")
+                    return caption
 
         except Exception as e:
             self._image_caption_errors += 1
@@ -755,7 +1018,7 @@ class Main(star.Star):
             sender_name=event.get_sender_name() or sender_id,
             content=content[:500],
             timestamp=time.time(),
-            is_bot=(sender_id == self._analyzer._bot_id),
+            is_bot=(sender_id == self._analyzer.bot_id),
         )
 
         # 提取 @ 和回复信息
@@ -763,7 +1026,7 @@ class Main(star.Star):
             if isinstance(comp, At):
                 qq_str = str(comp.qq)
                 msg.at_targets.append((qq_str, comp.name or qq_str))
-                if qq_str == self._analyzer._bot_id:
+                if qq_str == self._analyzer.bot_id:
                     msg.at_bot = True
             elif isinstance(comp, Reply):
                 if comp.sender_id:
@@ -795,14 +1058,26 @@ class Main(star.Star):
         # 使用支持图像转述的方法提取消息
         msg = await self._extract_message_with_caption(event)
         state = self._sessions.get(event.unified_msg_origin)
-        self._analyzer.infer_addressee(
+        inference_reason = self._analyzer.infer_addressee(
             msg,
             state.messages,
             bot_replied_to=state.bot_last_replied_to,
             bot_replied_to_name=state.bot_last_replied_to_name,
         )
 
-        self._sessions.add_message(event.unified_msg_origin, msg)
+        # v3.0.0: 推断规则日志（可观测性增强）
+        if self._cfg_bool("debug_inference", False):
+            talking_to_display = (
+                "Bot" if msg.talking_to == "bot"
+                else ("群聊" if msg.talking_to == "group" else msg.talking_to_name)
+            )
+            logger.debug(
+                f"[ContextAware] 推断: {msg.sender_name} → {talking_to_display} "
+                f"(规则: {inference_reason})"
+            )
+
+        # v3.0.0: 使用异步方法确保并发安全
+        await self._sessions.add_message_async(event.unified_msg_origin, msg)
         self._stats.messages_recorded += 1
 
         # 每记录 50 条消息输出一次统计
@@ -833,7 +1108,7 @@ class Main(star.Star):
         if not self._sessions.has_session(umo):
             # 使用支持图像转述的方法
             msg = await self._extract_message_with_caption(event)
-            self._sessions.add_message(umo, msg)
+            await self._sessions.add_message_async(umo, msg)
 
         try:
             state = self._sessions.get(umo)
@@ -841,14 +1116,14 @@ class Main(star.Star):
                 return
 
             # 检查是否为戳一戳触发
-            is_poke_trigger = bool(event.get_extra("_poke_trigger"))
+            is_poke_trigger = bool(event.get_extra(ExtraKeys.POKE_TRIGGER))
             
             if is_poke_trigger:
                 # 戳一戳触发时，创建虚拟的 current 消息表示戳一戳用户
-                poke_sender_id = event.get_extra("_poke_sender_id") or event.get_sender_id()
-                poke_sender_name = event.get_extra("_poke_sender_name") or event.get_sender_name() or poke_sender_id
+                poke_sender_id = event.get_extra(ExtraKeys.POKE_SENDER_ID) or event.get_sender_id()
+                poke_sender_name = event.get_extra(ExtraKeys.POKE_SENDER_NAME) or event.get_sender_name() or poke_sender_id
                 current = MessageRecord(
-                    msg_id=f"poke_{time.time()}",
+                    msg_id=f"poke_{uuid.uuid4().hex[:12]}",
                     sender_id=str(poke_sender_id),
                     sender_name=str(poke_sender_name),
                     content=f"[戳了戳你]",
@@ -858,12 +1133,19 @@ class Main(star.Star):
                     talking_to_name="你",
                 )
             else:
-                current = state.messages[-1]
+                # 获取最后一条消息
+                messages_list = list(state.messages)
+                if messages_list:
+                    current = messages_list[-1]
+                else:
+                    logger.warning("[ContextAware] 会话无消息记录，跳过场景注入")
+                    return
                 
             trigger_type, trigger_desc = self._analyzer.detect_trigger(event, current)
 
-            window = int(self._cfg("dialogue_window", 8) or 8)
-            flow = state.messages[-window:]
+            window = self._cfg_int("dialogue_window", 8)
+            messages_list = list(state.messages)
+            flow = messages_list[-window:] if window > 0 else messages_list
 
             now = time.time()
             bot_status: dict[str, float | str | bool] = {}
@@ -887,17 +1169,8 @@ class Main(star.Star):
                 show_flow=bool(self._cfg("enable_dialogue_flow", True)),
             )
 
-            # 注入场景描述到请求
-            # 优先使用 extra_user_content_parts，如果不存在则回退到 system_prompt
-            try:
-                if hasattr(req, 'extra_user_content_parts') and req.extra_user_content_parts is not None:
-                    req.extra_user_content_parts.append(TextPart(text=scene))
-                else:
-                    # 回退方案：添加到 system_prompt
-                    req.system_prompt = (req.system_prompt or "") + "\n\n" + scene
-            except AttributeError:
-                # 兼容旧版本 AstrBot
-                req.system_prompt = (req.system_prompt or "") + "\n\n" + scene
+            # 注入场景描述到请求（v3.0.0: 防止重复注入）
+            self._inject_scene(req, scene)
 
             self._stats.scenes_injected += 1
             self._stats.record_trigger(trigger_type)
@@ -972,7 +1245,7 @@ class Main(star.Star):
         self,
         unified_msg_origin: str,
         count: int = 10,
-    ) -> list[dict]:
+    ) -> list[dict[str, Any]]:
         """获取指定会话的最近消息历史
 
         供其他插件（如 poke_to_llm）调用，获取群聊上下文。
@@ -993,7 +1266,9 @@ class Main(star.Star):
             return []
 
         state = self._sessions.get(unified_msg_origin)
-        messages = state.messages[-count:] if count > 0 else state.messages
+        # v3.0.0: 将 deque 转为 list 以支持切片
+        messages_list = list(state.messages)
+        messages = messages_list[-count:] if count > 0 else messages_list
 
         return [
             {
