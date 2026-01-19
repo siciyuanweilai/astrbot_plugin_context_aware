@@ -807,7 +807,14 @@ class Main(star.Star):
         self._image_caption_semaphore = asyncio.Semaphore(3)  # 最多并发3个
         self._image_caption_cache: OrderedDict[str, str] = OrderedDict()  # URL -> caption (LRU)
         self._image_caption_cache_max = 100  # 硬上限
-        self._image_caption_timeout = 15.0  # 15秒超时
+        # 用户可配置超时（范围校验：5-300秒，防止误配置）
+        _timeout_cfg = self._cfg_int("image_caption_timeout", 60)
+        if _timeout_cfg < 5 or _timeout_cfg > 300:
+            logger.warning(
+                f"[ContextAware] image_caption_timeout={_timeout_cfg} 超出合理范围(5-300)，已回退为60秒"
+            )
+            _timeout_cfg = 60
+        self._image_caption_timeout = float(_timeout_cfg)
 
         self._sessions = SessionManager(
             max_messages=self._cfg_int("max_history", 50),
