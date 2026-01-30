@@ -1,11 +1,11 @@
 """
-AstrBot 上下文场景感知增强插件 v3.0.0 (Context-Aware Enhancement)
+AstrBot 上下文场景感知增强插件 v3.1.0 (Context-Aware Enhancement)
 
 为 LLM 提供结构化的群聊场景描述，增强其对对话情境的理解能力。
 重点解决：主动回复时 Bot 误以为别人在问自己的问题。
 
 核心功能:
-- 触发类型检测: 被@、被回复、唤醒词、主动搭话、戳一戳
+- 触发类型检测: 被@、被回复、唤醒词、正则唤醒、主动搭话、戳一戳
 - 对话对象推断: 谁在和谁说话（关键功能）
 - 对话流分析: 最近的对话结构
 - Bot 状态追踪: 上次发言时间和内容
@@ -15,6 +15,10 @@ AstrBot 上下文场景感知增强插件 v3.0.0 (Context-Aware Enhancement)
 - 只做加法，不修改框架原有信息
 - 可完全替代框架内置 LTM 的群聊记录功能
 - 轻量高效，图像转述为可选功能
+
+v3.1.0 更新:
+- [NEW] 集成正则唤醒功能 (waking_regex)
+- [HIGH] 识别正则触发类型并在 Prompt 中明确指示
 
 v3.0.0 更新 (重大重构):
 - [CRITICAL] 修复并发竞态: SessionManager 添加异步锁 + deque 替代 list
@@ -28,18 +32,14 @@ v3.0.0 更新 (重大重构):
 - [MEDIUM] 增强可观测性: 推断规则日志
 - [LOW] 修复时间戳精度: 使用 uuid
 
-v2.5.1 更新:
-- 新增戳一戳触发类型（TRIGGER_POKE）
-- 支持 poke_to_llm 插件的 _poke_trigger 标记
-- 戳一戳时正确显示戳一戳用户信息
-
 Author: 木有知
-Version: 3.0.0
+Version: 3.1.0
 """
 
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 import uuid
 from collections import OrderedDict, deque
@@ -71,6 +71,7 @@ class ExtraKeys:
     POKE_SENDER_NAME: Final[str] = "_poke_sender_name"
     ACTIVE_TRIGGER: Final[str] = "_active_trigger"
     ACTIVE_REPLY_TRIGGERED: Final[str] = "active_reply_triggered"
+    REGEX_TRIGGERED: Final[str] = "_regex_triggered"  # 正则触发标记
     
     # 场景注入标记，防止重复注入
     SCENE_INJECTED_MARKER: Final[str] = "<!-- context_aware_scene_v3 -->"
@@ -85,6 +86,7 @@ TRIGGER_PRIVATE: Final = "private_chat"
 TRIGGER_AT: Final = "at_bot"
 TRIGGER_REPLY: Final = "reply_to_bot"
 TRIGGER_WAKE: Final = "wake_word"
+TRIGGER_REGEX: Final = "regex_match"
 TRIGGER_MENTION: Final = "mention"
 TRIGGER_ACTIVE: Final = "active"
 TRIGGER_POKE: Final = "poke"
@@ -96,6 +98,7 @@ TRIGGER_NAMES: Final = {
     TRIGGER_AT: "@Bot",
     TRIGGER_REPLY: "回复Bot",
     TRIGGER_WAKE: "唤醒词",
+    TRIGGER_REGEX: "正则唤醒",
     TRIGGER_MENTION: "提及Bot",
     TRIGGER_ACTIVE: "主动触发",
     TRIGGER_POKE: "戳一戳",
@@ -470,6 +473,10 @@ class SceneAnalyzer:
         """检测触发类型"""
         sender = msg.sender_name
 
+        # 检查是否为正则触发 (检查 Main.on_message 中设置的属性)
+        if getattr(event, ExtraKeys.REGEX_TRIGGERED, False):
+            return TRIGGER_REGEX, f"{sender} 触发了设定的关键词，正在呼叫你"
+
         # 检查是否为戳一戳触发（由 poke_to_llm 插件设置）
         if event.get_extra(ExtraKeys.POKE_TRIGGER):
             poke_sender_name = event.get_extra(ExtraKeys.POKE_SENDER_NAME) or sender
@@ -699,12 +706,12 @@ class SceneGenerator:
         生成行为指导 - 这是解决"误以为在问自己"问题的关键
         
         核心原则：
-        - 明确触发（@、回复、唤醒词、私聊、戳一戳）→ 正常回应
+        - 明确触发（@、回复、唤醒词、私聊、戳一戳、正则）→ 正常回应
         - 主动触发 → 必须明确告知 Bot 它是主动插入的
         - 未知触发 → 最保守处理
         """
         # ===== 被明确呼叫 - 正常回复 =====
-        if trigger in (TRIGGER_AT, TRIGGER_REPLY, TRIGGER_WAKE, TRIGGER_PRIVATE):
+        if trigger in (TRIGGER_AT, TRIGGER_REPLY, TRIGGER_WAKE, TRIGGER_PRIVATE, TRIGGER_REGEX):
             return "用户在和你对话，请正常回应。"
 
         # ===== 戳一戳触发 - 用户主动找你 =====
@@ -825,13 +832,24 @@ class Main(star.Star):
 
         self._bot_id: str | None = None
         self._analyzer: SceneAnalyzer | None = None
+        
+        # 加载正则唤醒配置
+        self._waking_regex_patterns = []
+        regex_list = self._cfg_list("waking_regex", [])
+        for r in regex_list:
+            try:
+                self._waking_regex_patterns.append(re.compile(r))
+            except re.error as e:
+                logger.error(f"[ContextAware] 正则表达式错误 '{r}': {e}")
+        if self._waking_regex_patterns:
+            logger.info(f"[ContextAware] 已加载 {len(self._waking_regex_patterns)} 个正则唤醒词")
 
         # 图像转述统计
         self._image_caption_count = 0
         self._image_caption_errors = 0
         self._image_caption_cache_hits = 0
 
-        version = "3.0.0"
+        version = "3.1.0"
         caption_status = "已启用" if self._image_caption_enabled else "未启用"
         logger.info(f"[ContextAware] 插件 v{version} 已加载 | 图像转述: {caption_status}")
 
@@ -1050,6 +1068,17 @@ class Main(star.Star):
         """监听所有消息，记录到历史"""
         if not self._should_process(event):
             return
+
+        # 检查正则唤醒
+        if not event.is_at_or_wake_command and event.message_str and self._waking_regex_patterns:
+            for pattern in self._waking_regex_patterns:
+                if pattern.search(event.message_str):
+                    # 强制唤醒
+                    event.is_at_or_wake_command = True
+                    # 标记触发来源
+                    setattr(event, ExtraKeys.REGEX_TRIGGERED, True)
+                    logger.debug(f"[ContextAware] 正则唤醒匹配: {pattern.pattern}")
+                    break
 
         has_content = any(
             isinstance(c, (Plain, Image)) for c in event.get_messages()
