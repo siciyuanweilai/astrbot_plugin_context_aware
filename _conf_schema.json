@@ -81,5 +81,90 @@
     "condition": {
       "image_caption": true
     }
+  },
+  "history_compress_strategy": {
+    "description": "群聊历史压缩策略（可选）",
+    "type": "string",
+    "default": "off",
+    "options": ["off", "llm_summary"],
+    "labels": ["关闭", "LLM 摘要压缩"],
+    "hint": "开启后会额外调用一次 LLM 来生成摘要，用于降低上下文膨胀与误判风险。"
+  },
+  "history_compress_trigger_count": {
+    "description": "触发压缩的消息数阈值",
+    "type": "int",
+    "default": 48,
+    "min": 20,
+    "max": 500,
+    "condition": {
+      "history_compress_strategy": "llm_summary"
+    }
+  },
+  "history_compress_keep_recent": {
+    "description": "压缩时保留最近消息数",
+    "type": "int",
+    "default": 16,
+    "min": 5,
+    "max": 200,
+    "condition": {
+      "history_compress_strategy": "llm_summary"
+    }
+  },
+  "history_compress_min_interval_sec": {
+    "description": "两次压缩的最小间隔（秒）",
+    "type": "int",
+    "default": 300,
+    "min": 30,
+    "max": 86400,
+    "condition": {
+      "history_compress_strategy": "llm_summary"
+    }
+  },
+  "history_compress_provider_id": {
+    "description": "用于历史压缩的模型提供商 ID（留空则使用当前会话默认模型）",
+    "type": "string",
+    "default": "",
+    "_special": "select_provider",
+    "condition": {
+      "history_compress_strategy": "llm_summary"
+    }
+  },
+  "history_compress_instruction": {
+    "description": "历史压缩提示词（留空使用内置默认）",
+    "type": "text",
+    "default": "",
+    "condition": {
+      "history_compress_strategy": "llm_summary"
+    }
+  },
+  "history_compress_timeout": {
+    "description": "历史压缩超时时间（秒）",
+    "type": "int",
+    "default": 60,
+    "min": 10,
+    "max": 600,
+    "condition": {
+      "history_compress_strategy": "llm_summary"
+    }
+  },
+  "history_compress_max_input_chars": {
+    "description": "压缩输入最大字符数（超出时从末尾截取）",
+    "type": "int",
+    "default": 5000,
+    "min": 1000,
+    "max": 50000,
+    "condition": {
+      "history_compress_strategy": "llm_summary"
+    }
+  },
+  "history_compress_max_summary_chars": {
+    "description": "摘要最大字符数（超出截断）",
+    "type": "int",
+    "default": 800,
+    "min": 200,
+    "max": 5000,
+    "condition": {
+      "history_compress_strategy": "llm_summary"
+    }
   }
 }

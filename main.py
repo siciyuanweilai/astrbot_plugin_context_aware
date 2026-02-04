@@ -1,5 +1,5 @@
 """
-AstrBot 上下文场景感知增强插件 v3.0.0 (Context-Aware Enhancement)
+AstrBot 上下文场景感知增强插件 v3.1.1 (Context-Aware Enhancement)
 
 为 LLM 提供结构化的群聊场景描述，增强其对对话情境的理解能力。
 重点解决：主动回复时 Bot 误以为别人在问自己的问题。
@@ -15,6 +15,11 @@ AstrBot 上下文场景感知增强插件 v3.0.0 (Context-Aware Enhancement)
 - 只做加法，不修改框架原有信息
 - 可完全替代框架内置 LTM 的群聊记录功能
 - 轻量高效，图像转述为可选功能
+
+v3.1.1 更新:
+- [FIX] 修复 SessionState 字段重复定义问题
+- [FIX] 修复超时配置代码(300s)与schema(600s)不一致
+- [FIX] 修复 Bot 消息 ID 使用时间戳可能冲突，改用 uuid
 
 v3.0.0 更新 (重大重构):
 - [CRITICAL] 修复并发竞态: SessionManager 添加异步锁 + deque 替代 list
@@ -34,12 +39,13 @@ v2.5.1 更新:
 - 戳一戳时正确显示戳一戳用户信息
 
 Author: 木有知
-Version: 3.0.0
+Version: 3.1.1
 """
 
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 import uuid
 from collections import OrderedDict, deque
@@ -49,7 +55,7 @@ from typing import TYPE_CHECKING, Any, Final, final
 from astrbot import logger
 from astrbot.api import star
 from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.message_components import At, Image, Plain, Reply
+from astrbot.api.message_components import At, AtAll, Image, Plain, Reply
 from astrbot.api.provider import LLMResponse, Provider, ProviderRequest
 from astrbot.core.agent.message import TextPart
 
@@ -71,6 +77,7 @@ class ExtraKeys:
     POKE_SENDER_NAME: Final[str] = "_poke_sender_name"
     ACTIVE_TRIGGER: Final[str] = "_active_trigger"
     ACTIVE_REPLY_TRIGGERED: Final[str] = "active_reply_triggered"
+    CURRENT_MESSAGE_RECORD: Final[str] = "_context_aware_current_message_record"
     
     # 场景注入标记，防止重复注入
     SCENE_INJECTED_MARKER: Final[str] = "<!-- context_aware_scene_v3 -->"
@@ -83,6 +90,7 @@ class ExtraKeys:
 # 触发类型常量
 TRIGGER_PRIVATE: Final = "private_chat"
 TRIGGER_AT: Final = "at_bot"
+TRIGGER_AT_ALL: Final = "at_all"
 TRIGGER_REPLY: Final = "reply_to_bot"
 TRIGGER_WAKE: Final = "wake_word"
 TRIGGER_MENTION: Final = "mention"
@@ -94,6 +102,7 @@ TRIGGER_UNKNOWN: Final = "unknown"
 TRIGGER_NAMES: Final = {
     TRIGGER_PRIVATE: "私聊",
     TRIGGER_AT: "@Bot",
+    TRIGGER_AT_ALL: "@全体",
     TRIGGER_REPLY: "回复Bot",
     TRIGGER_WAKE: "唤醒词",
     TRIGGER_MENTION: "提及Bot",
@@ -123,6 +132,7 @@ class InferenceReason:
     RULE_2_AT_OTHER: Final[str] = "rule_2_at_other"       # @其他人
     RULE_3_REPLY: Final[str] = "rule_3_reply"             # 引用回复
     RULE_4_BOT_REPLIED: Final[str] = "rule_4_bot_replied" # Bot 刚回复过此人
+    RULE_4B_BOT_INTERRUPTED: Final[str] = "rule_4b_bot_interrupted" # Bot 插话导致误判，回退给上一位对话者
     RULE_5_ABA_PATTERN: Final[str] = "rule_5_aba_pattern" # A-B-A 对话模式
     RULE_6_QUICK_FOLLOW: Final[str] = "rule_6_quick_follow"  # 快速连续对话
     DEFAULT_GROUP: Final[str] = "default_group"           # 默认群聊
@@ -144,6 +154,7 @@ class MessageRecord:
     timestamp: float  # Unix timestamp
     is_bot: bool = False
     at_bot: bool = False
+    at_all: bool = False
     reply_to_id: str | None = None
     talking_to: str = "group"
     talking_to_name: str = "群聊"
@@ -153,8 +164,9 @@ class MessageRecord:
 @dataclass(slots=True)
 class SessionState:
     """会话状态 - 每个群聊/私聊一个
-    
+
     v3.0.0: 使用 deque 替代 list，避免手动裁剪的非原子操作
+    v3.1.1: 修复字段重复定义问题
     """
 
     messages: deque[MessageRecord] = field(default_factory=lambda: deque(maxlen=50))
@@ -162,8 +174,13 @@ class SessionState:
     bot_last_content: str = ""
     bot_last_replied_to: str = ""  # Bot 上次回复的对象 ID
     bot_last_replied_to_name: str = ""  # Bot 上次回复的对象名称
-    # v3.0.0: 关键锚点分离，不随消息淘汰
+    # 关键锚点分离，不随消息淘汰
     last_user_interaction: dict[str, float] = field(default_factory=dict)  # user_id -> timestamp
+    # 会话摘要（用于上下文压缩）
+    summary: str = ""
+    summary_updated_at: float = 0.0
+    summary_message_count: int = 0
+    compressing: bool = False
 
 
 @dataclass
@@ -177,6 +194,20 @@ class PluginStats:
 
     def record_trigger(self, trigger_type: str) -> None:
         self.trigger_counts[trigger_type] = self.trigger_counts.get(trigger_type, 0) + 1
+
+
+@dataclass(slots=True)
+class SessionSnapshot:
+    """会话快照（避免在锁外直接读写 SessionState 导致竞态）"""
+
+    messages: list[MessageRecord]
+    bot_last_spoke_at: float
+    bot_last_content: str
+    bot_last_replied_to: str
+    bot_last_replied_to_name: str
+    summary: str
+    summary_updated_at: float
+    summary_message_count: int
 
 
 # ============================================================================
@@ -263,6 +294,65 @@ class SessionManager:
             state.messages.append(msg)
             if not msg.is_bot:
                 state.last_user_interaction[msg.sender_id] = msg.timestamp
+
+    async def get_snapshot_async(self, session_id: str) -> SessionSnapshot:
+        """获取会话快照（带会话锁）"""
+        async with self._get_lock(session_id):
+            state = await self._get_or_create_session(session_id)
+            return SessionSnapshot(
+                messages=list(state.messages),
+                bot_last_spoke_at=state.bot_last_spoke_at,
+                bot_last_content=state.bot_last_content,
+                bot_last_replied_to=state.bot_last_replied_to,
+                bot_last_replied_to_name=state.bot_last_replied_to_name,
+                summary=state.summary,
+                summary_updated_at=state.summary_updated_at,
+                summary_message_count=state.summary_message_count,
+            )
+
+    async def mark_compressing_async(self, session_id: str) -> bool:
+        """尝试标记会话正在压缩（避免并发重复压缩）。成功返回 True。"""
+        async with self._get_lock(session_id):
+            state = await self._get_or_create_session(session_id)
+            if state.compressing:
+                return False
+            state.compressing = True
+            return True
+
+    async def clear_compressing_async(self, session_id: str) -> None:
+        async with self._get_lock(session_id):
+            if session_id in self._sessions:
+                self._sessions[session_id].compressing = False
+
+    async def set_summary_and_trim_async(
+        self,
+        session_id: str,
+        *,
+        summary: str,
+        keep_recent: int,
+        summarized_count: int,
+        updated_at: float,
+    ) -> None:
+        """设置摘要并裁剪历史（带会话锁）"""
+        keep_recent = max(5, keep_recent)
+        async with self._get_lock(session_id):
+            state = await self._get_or_create_session(session_id)
+            msgs = list(state.messages)
+            recent = msgs[-keep_recent:] if msgs else []
+            state.messages = deque(recent, maxlen=state.messages.maxlen)
+            state.summary = summary
+            state.summary_updated_at = updated_at
+            state.summary_message_count = max(state.summary_message_count, summarized_count)
+            state.compressing = False
+
+    async def remove_session_async(self, session_id: str) -> int:
+        """移除整个会话（用于 reset/new/switch 等清空场景）"""
+        async with self._cache_lock:
+            state = self._sessions.pop(session_id, None)
+            self._locks.pop(session_id, None)
+            if not state:
+                return 0
+            return len(state.messages)
 
     def add_message(self, session_id: str, msg: MessageRecord) -> None:
         """同步添加消息（向后兼容，但不推荐在并发场景使用）
@@ -408,7 +498,7 @@ class SceneAnalyzer:
     v3.0.0: 添加 bot_id 只读属性，支持自定义回复特征词
     """
 
-    __slots__ = ("_bot_id", "_bot_names", "_reply_starters")
+    __slots__ = ("_bot_id", "_bot_names", "_bot_name_patterns", "_reply_starters")
 
     def __init__(
         self, 
@@ -417,9 +507,18 @@ class SceneAnalyzer:
         reply_starters: frozenset[str] | None = None,
     ) -> None:
         self._bot_id = bot_id
-        self._bot_names: tuple[str, ...] = tuple(
-            n.lower() for n in (bot_names or []) if n
-        )
+        names = [n.lower() for n in (bot_names or []) if n]
+        self._bot_names: tuple[str, ...] = tuple(names)
+        # 为英文/数字类名字做边界匹配，降低误触发（如 “robot” 包含 “bot”）
+        compiled: list[tuple[str, re.Pattern[str] | None]] = []
+        for n in names:
+            if re.fullmatch(r"[a-z0-9_]+", n):
+                compiled.append(
+                    (n, re.compile(rf"(?<![\\w]){re.escape(n)}(?![\\w])", re.IGNORECASE))
+                )
+            else:
+                compiled.append((n, None))
+        self._bot_name_patterns: tuple[tuple[str, re.Pattern[str] | None], ...] = tuple(compiled)
         self._reply_starters = reply_starters or DEFAULT_REPLY_STARTERS
 
     @property
@@ -458,6 +557,8 @@ class SceneAnalyzer:
                 msg.at_targets.append((qq_str, comp.name or qq_str))
                 if qq_str == self._bot_id:
                     msg.at_bot = True
+            elif isinstance(comp, AtAll):
+                msg.at_all = True
             elif isinstance(comp, Reply):
                 if comp.sender_id:
                     msg.reply_to_id = str(comp.sender_id)
@@ -481,6 +582,9 @@ class SceneAnalyzer:
         if msg.at_bot:
             return TRIGGER_AT, f"{sender} @了你，需要你回应"
 
+        if msg.at_all:
+            return TRIGGER_AT_ALL, f"{sender} @了全体成员（包含你），可能希望你回应"
+
         if msg.reply_to_id == self._bot_id:
             return TRIGGER_REPLY, f"{sender} 回复了你之前的消息"
 
@@ -489,11 +593,20 @@ class SceneAnalyzer:
 
         if self._bot_names:
             msg_lower = msg.content.lower()
-            for name in self._bot_names:
-                if name in msg_lower:
-                    return TRIGGER_MENTION, f"{sender} 在消息中提到了你"
+            for name, pat in self._bot_name_patterns:
+                if pat:
+                    if pat.search(msg_lower):
+                        return TRIGGER_MENTION, f"{sender} 在消息中提到了你"
+                else:
+                    if name and name in msg_lower:
+                        return TRIGGER_MENTION, f"{sender} 在消息中提到了你"
 
         if event.get_extra(ExtraKeys.ACTIVE_TRIGGER) or event.get_extra(ExtraKeys.ACTIVE_REPLY_TRIGGERED):
+            return TRIGGER_ACTIVE, "你是主动加入这个对话的，没有人在叫你"
+
+        # 如果没有任何显式唤醒条件但仍触发了 LLM 请求，通常属于“主动回复/主动搭话”类场景
+        # （例如 AstrBot 的主动回复功能或其他插件主动调用 request_llm）
+        if not event.is_at_or_wake_command and not event.is_private_chat():
             return TRIGGER_ACTIVE, "你是主动加入这个对话的，没有人在叫你"
 
         return TRIGGER_UNKNOWN, "触发原因未知"
@@ -560,10 +673,30 @@ class SceneAnalyzer:
 
         # ===== 规则4: Bot 刚回复过当前用户，且用户像在回应（中置信度）=====
         # 关键修复：必须是 Bot 之前在回复"当前这个用户"，才能推断用户在回复 Bot
-        if last.is_bot and time_gap < 45:
+        if last.is_bot and time_gap < 35:
             # 检查 Bot 上次是否在回复当前发言者
             if bot_replied_to == msg.sender_id:
-                if self._looks_like_reply(msg.content):
+                stripped = msg.content.strip()
+                # 保守：只对“短确认/致谢类”做推断，避免把用户对他人的“好的/嗯”等当成回复 Bot
+                if stripped and len(stripped) <= 20 and self._looks_like_reply(stripped):
+                    # 若 Bot 插话前，群里有人刚刚在和该用户说话，则优先认为用户在回那个人
+                    history_list = list(history) if isinstance(history, deque) else history
+                    prev_to_user: MessageRecord | None = None
+                    for m in reversed(history_list[:-1]):
+                        if msg.timestamp - m.timestamp > 90:
+                            break
+                        if m.is_bot or m.sender_id == msg.sender_id:
+                            continue
+                        if m.talking_to == msg.sender_id:
+                            prev_to_user = m
+                            break
+                    if prev_to_user and (last.timestamp - prev_to_user.timestamp) < 60:
+                        msg.talking_to, msg.talking_to_name = (
+                            prev_to_user.sender_id,
+                            prev_to_user.sender_name,
+                        )
+                        return InferenceReason.RULE_4B_BOT_INTERRUPTED
+
                     msg.talking_to, msg.talking_to_name = "bot", "你"
                     return InferenceReason.RULE_4_BOT_REPLIED
             # 如果 Bot 不是在回复这个人，则这个人的"谢谢"大概率不是对 Bot 说的
@@ -625,6 +758,7 @@ class SceneGenerator:
         flow: list[MessageRecord],
         bot_status: dict[str, float | str | bool],
         participants: list[str],
+        summary: str = "",
         *,
         show_flow: bool = True,
     ) -> str:
@@ -662,6 +796,9 @@ class SceneGenerator:
             parts.append(f'  <instruction>{instruction}</instruction>')
 
         # ===== 4. 对话流（简化）=====
+        if summary:
+            parts.append(f'  <history_summary>{esc(summary[:600])}</history_summary>')
+
         if show_flow and len(flow) > 1:
             flow_lines: list[str] = []
             for m in flow[-5:]:
@@ -704,7 +841,7 @@ class SceneGenerator:
         - 未知触发 → 最保守处理
         """
         # ===== 被明确呼叫 - 正常回复 =====
-        if trigger in (TRIGGER_AT, TRIGGER_REPLY, TRIGGER_WAKE, TRIGGER_PRIVATE):
+        if trigger in (TRIGGER_AT, TRIGGER_AT_ALL, TRIGGER_REPLY, TRIGGER_WAKE, TRIGGER_PRIVATE):
             return "用户在和你对话，请正常回应。"
 
         # ===== 戳一戳触发 - 用户主动找你 =====
@@ -807,14 +944,17 @@ class Main(star.Star):
         self._image_caption_semaphore = asyncio.Semaphore(3)  # 最多并发3个
         self._image_caption_cache: OrderedDict[str, str] = OrderedDict()  # URL -> caption (LRU)
         self._image_caption_cache_max = 100  # 硬上限
-        # 用户可配置超时（范围校验：5-300秒，防止误配置）
+        # 用户可配置超时（范围校验：10-600秒，与 schema 对齐）
         _timeout_cfg = self._cfg_int("image_caption_timeout", 60)
-        if _timeout_cfg < 5 or _timeout_cfg > 300:
+        if _timeout_cfg < 10 or _timeout_cfg > 600:
             logger.warning(
-                f"[ContextAware] image_caption_timeout={_timeout_cfg} 超出合理范围(5-300)，已回退为60秒"
+                f"[ContextAware] image_caption_timeout={_timeout_cfg} 超出合理范围(10-600)，已回退为60秒"
             )
             _timeout_cfg = 60
         self._image_caption_timeout = float(_timeout_cfg)
+
+        # v3.1.0: 历史压缩（可选，默认关闭以避免额外 LLM 调用）
+        self._history_compress_semaphore = asyncio.Semaphore(1)
 
         self._sessions = SessionManager(
             max_messages=self._cfg_int("max_history", 50),
@@ -831,7 +971,7 @@ class Main(star.Star):
         self._image_caption_errors = 0
         self._image_caption_cache_hits = 0
 
-        version = "3.0.0"
+        version = "3.1.1"
         caption_status = "已启用" if self._image_caption_enabled else "未启用"
         logger.info(f"[ContextAware] 插件 v{version} 已加载 | 图像转述: {caption_status}")
 
@@ -923,6 +1063,138 @@ class Main(star.Star):
         )
         logger.info(f"[ContextAware] 初始化完成，Bot ID: {self._bot_id}")
         return True
+
+    # -------------------------------------------------------------------------
+    # History Compression (Optional)
+    # -------------------------------------------------------------------------
+
+    def _history_compress_cfg(self) -> dict[str, Any]:
+        """读取历史压缩配置（插件内置；默认关闭以避免额外 LLM 调用）"""
+        strategy = str(self._cfg("history_compress_strategy", "off") or "off")
+        return {
+            "strategy": strategy,  # off | llm_summary
+            "trigger_count": self._cfg_int("history_compress_trigger_count", 48),
+            "keep_recent": self._cfg_int("history_compress_keep_recent", 16),
+            "min_interval_sec": self._cfg_int("history_compress_min_interval_sec", 300),
+            "provider_id": str(self._cfg("history_compress_provider_id", "") or ""),
+            "instruction": str(self._cfg("history_compress_instruction", "") or ""),
+            "timeout_sec": float(self._cfg_int("history_compress_timeout", 60)),
+            "max_input_chars": self._cfg_int("history_compress_max_input_chars", 5000),
+            "max_summary_chars": self._cfg_int("history_compress_max_summary_chars", 800),
+        }
+
+    def _build_summary_input(self, msgs: list[MessageRecord], *, max_chars: int) -> str:
+        lines: list[str] = []
+        for m in msgs:
+            sender = "[你]" if m.is_bot else m.sender_name
+            if m.talking_to == "bot":
+                to = "[你]"
+            elif m.talking_to == "group":
+                to = "群聊"
+            else:
+                to = m.talking_to_name or m.talking_to
+            content = (m.content or "").replace("\n", " ").strip()
+            if len(content) > 120:
+                content = content[:117] + "..."
+            lines.append(f"{sender} -> {to}: {content}")
+        text = "\n".join(lines)
+        if len(text) <= max_chars:
+            return text
+        # 输入过长时保留末尾（更贴近当前主题）
+        return text[-max_chars:]
+
+    async def _maybe_compress_history(self, umo: str, snapshot: SessionSnapshot) -> SessionSnapshot:
+        cfg = self._history_compress_cfg()
+        if cfg["strategy"] != "llm_summary":
+            return snapshot
+
+        trigger_count = max(10, int(cfg["trigger_count"]))
+        keep_recent = max(5, int(cfg["keep_recent"]))
+        if len(snapshot.messages) < trigger_count or len(snapshot.messages) <= keep_recent + 5:
+            return snapshot
+
+        now = time.time()
+        if snapshot.summary_updated_at and (now - snapshot.summary_updated_at) < float(cfg["min_interval_sec"]):
+            return snapshot
+
+        # 避免同一会话并发重复压缩
+        if not await self._sessions.mark_compressing_async(umo):
+            return snapshot
+
+        try:
+            async with self._history_compress_semaphore:
+                provider: Provider | None = None
+                provider_id = str(cfg["provider_id"] or "")
+                if provider_id:
+                    p = self._context.get_provider_by_id(provider_id)
+                    if isinstance(p, Provider):
+                        provider = p
+                else:
+                    p = self._context.get_using_provider(umo)
+                    if isinstance(p, Provider):
+                        provider = p
+
+                if not provider:
+                    await self._sessions.clear_compressing_async(umo)
+                    return snapshot
+
+                instruction = cfg["instruction"].strip()
+                if not instruction:
+                    instruction = (
+                        "你是“群聊上下文压缩器”。请将下面这段群聊/机器人对话历史压缩成一段简洁中文摘要，要求：\n"
+                        "1) 保留关键事实、结论、已达成的决定、正在讨论的话题、未解决的问题。\n"
+                        "2) 尽量保留人物关系与称呼（谁在对谁说什么），但不要逐条复述。\n"
+                        "3) 输出长度控制在 200-600 字，避免空话套话。\n"
+                    )
+
+                to_summarize = snapshot.messages[:-keep_recent]
+                input_text = self._build_summary_input(
+                    to_summarize, max_chars=int(cfg["max_input_chars"])
+                )
+
+                prompt_parts = []
+                if snapshot.summary:
+                    prompt_parts.append(f"已有摘要（可在此基础上更新）：\n{snapshot.summary}\n")
+                prompt_parts.append(f"需要压缩的历史：\n{input_text}\n")
+                prompt_parts.append("请输出新的摘要：")
+                prompt = "\n".join(prompt_parts)
+
+                try:
+                    resp = await asyncio.wait_for(
+                        provider.text_chat(
+                            prompt=prompt,
+                            system_prompt=instruction,
+                            session_id=uuid.uuid4().hex,
+                            persist=False,
+                        ),
+                        timeout=float(cfg["timeout_sec"]),
+                    )
+                except asyncio.TimeoutError:
+                    await self._sessions.clear_compressing_async(umo)
+                    return snapshot
+
+                if not resp or not resp.completion_text:
+                    await self._sessions.clear_compressing_async(umo)
+                    return snapshot
+
+                summary = resp.completion_text.strip()
+                max_summary_chars = int(cfg["max_summary_chars"])
+                if len(summary) > max_summary_chars:
+                    summary = summary[: max_summary_chars - 3] + "..."
+
+                await self._sessions.set_summary_and_trim_async(
+                    umo,
+                    summary=summary,
+                    keep_recent=keep_recent,
+                    summarized_count=snapshot.summary_message_count + len(to_summarize),
+                    updated_at=now,
+                )
+
+                return await self._sessions.get_snapshot_async(umo)
+        except Exception as e:
+            logger.error(f"[ContextAware] 历史压缩失败: {e}")
+            await self._sessions.clear_compressing_async(umo)
+            return snapshot
 
     async def _get_image_caption(self, image_url: str) -> str | None:
         """获取图片描述（v3.0.0: 并发限流 + 超时 + 缓存）"""
@@ -1035,6 +1307,8 @@ class Main(star.Star):
                 msg.at_targets.append((qq_str, comp.name or qq_str))
                 if qq_str == self._analyzer.bot_id:
                     msg.at_bot = True
+            elif isinstance(comp, AtAll):
+                msg.at_all = True
             elif isinstance(comp, Reply):
                 if comp.sender_id:
                     msg.reply_to_id = str(comp.sender_id)
@@ -1064,15 +1338,21 @@ class Main(star.Star):
 
         # 使用支持图像转述的方法提取消息
         msg = await self._extract_message_with_caption(event)
-        state = self._sessions.get(event.unified_msg_origin)
+        snapshot = await self._sessions.get_snapshot_async(event.unified_msg_origin)
         inference_reason = self._analyzer.infer_addressee(
             msg,
-            state.messages,
-            bot_replied_to=state.bot_last_replied_to,
-            bot_replied_to_name=state.bot_last_replied_to_name,
+            snapshot.messages,
+            bot_replied_to=snapshot.bot_last_replied_to,
+            bot_replied_to_name=snapshot.bot_last_replied_to_name,
         )
 
         # v3.0.0: 推断规则日志（可观测性增强）
+        # 绑定当前事件的消息记录，供 on_llm_request 精确取 current/flow（避免并发取错最后一条）
+        try:
+            event.set_extra(ExtraKeys.CURRENT_MESSAGE_RECORD, msg)
+        except Exception:
+            pass
+
         if self._cfg_bool("debug_inference", False):
             talking_to_display = (
                 "Bot" if msg.talking_to == "bot"
@@ -1118,8 +1398,8 @@ class Main(star.Star):
             await self._sessions.add_message_async(umo, msg)
 
         try:
-            state = self._sessions.get(umo)
-            if not state.messages:
+            snapshot = await self._sessions.get_snapshot_async(umo)
+            if not snapshot.messages:
                 return
 
             # 检查是否为戳一戳触发
@@ -1139,29 +1419,56 @@ class Main(star.Star):
                     talking_to="bot",
                     talking_to_name="你",
                 )
+                flow_source = snapshot.messages
             else:
-                # 获取最后一条消息
-                messages_list = list(state.messages)
-                if messages_list:
-                    current = messages_list[-1]
-                else:
-                    logger.warning("[ContextAware] 会话无消息记录，跳过场景注入")
-                    return
+                current_from_extra = event.get_extra(ExtraKeys.CURRENT_MESSAGE_RECORD, None)
+                current = (
+                    current_from_extra
+                    if isinstance(current_from_extra, MessageRecord)
+                    else snapshot.messages[-1]
+                )
+
+                # 并发保护：flow 只截取到 current 为止，避免把其他并发消息带进来
+                flow_source = snapshot.messages
+                try:
+                    idx = next(
+                        (i for i, m in enumerate(flow_source) if m.msg_id == current.msg_id),
+                        -1,
+                    )
+                    if idx >= 0:
+                        flow_source = flow_source[: idx + 1]
+                except Exception:
+                    pass
                 
+            # 可选：压缩历史（会裁剪 flow_source 对应的底层会话）
+            snapshot2 = await self._maybe_compress_history(umo, snapshot)
+            if snapshot2 is not snapshot:
+                snapshot = snapshot2
+                flow_source = snapshot.messages
+                if not is_poke_trigger:
+                    try:
+                        idx2 = next(
+                            (i for i, m in enumerate(flow_source) if m.msg_id == current.msg_id),
+                            -1,
+                        )
+                        if idx2 >= 0:
+                            flow_source = flow_source[: idx2 + 1]
+                    except Exception:
+                        pass
+
             trigger_type, trigger_desc = self._analyzer.detect_trigger(event, current)
 
             window = self._cfg_int("dialogue_window", 8)
-            messages_list = list(state.messages)
-            flow = messages_list[-window:] if window > 0 else messages_list
+            flow = flow_source[-window:] if window > 0 else flow_source
 
             now = time.time()
             bot_status: dict[str, float | str | bool] = {}
-            if state.bot_last_spoke_at > 0:
-                mins = (now - state.bot_last_spoke_at) / 60
+            if snapshot.bot_last_spoke_at > 0:
+                mins = (now - snapshot.bot_last_spoke_at) / 60
                 bot_status = {
                     "active": True,
                     "minutes_ago": round(mins, 1),
-                    "content": state.bot_last_content,
+                    "content": snapshot.bot_last_content,
                 }
 
             participants = list({m.sender_name for m in flow if not m.is_bot})
@@ -1173,6 +1480,7 @@ class Main(star.Star):
                 flow=flow,
                 bot_status=bot_status,
                 participants=participants,
+                summary=snapshot.summary,
                 show_flow=bool(self._cfg("enable_dialogue_flow", True)),
             )
 
@@ -1219,7 +1527,7 @@ class Main(star.Star):
         sender_id = event.get_sender_id()
         sender_name = event.get_sender_name() or sender_id
 
-        self._sessions.record_bot_response(
+        await self._sessions.record_bot_response_async(
             umo,
             resp.completion_text,
             now,
@@ -1228,7 +1536,7 @@ class Main(star.Star):
         )
 
         bot_msg = MessageRecord(
-            msg_id=f"bot_{now}",
+            msg_id=f"bot_{uuid.uuid4().hex[:12]}",
             sender_id=self._bot_id or "bot",
             sender_name="[你]",
             content=resp.completion_text[:200],
@@ -1237,7 +1545,7 @@ class Main(star.Star):
             talking_to=sender_id,  # 记录 Bot 在回复谁
             talking_to_name=sender_name,
         )
-        self._sessions.add_message(umo, bot_msg)
+        await self._sessions.add_message_async(umo, bot_msg)
         self._stats.bot_responses_recorded += 1
 
         logger.debug(
@@ -1245,6 +1553,19 @@ class Main(star.Star):
         )
 
     # -------------------------------------------------------------------------
+    @filter.after_message_sent()
+    async def after_message_sent(self, event: AstrMessageEvent) -> None:
+        """跟随系统 reset/new/switch 清空本插件会话上下文（不注册新指令，避免冲突）"""
+        try:
+            if event.get_extra("_clean_ltm_session", False):
+                removed = await self._sessions.remove_session_async(event.unified_msg_origin)
+                if removed:
+                    logger.info(
+                        f"[ContextAware] 检测到会话清空标记，已清理 {event.unified_msg_origin} 的 {removed} 条上下文记录"
+                    )
+        except Exception as e:
+            logger.error(f"[ContextAware] 清理会话失败: {e}")
+
     # Public API - 供其他插件调用
     # -------------------------------------------------------------------------
 
@@ -1308,7 +1629,16 @@ class Main(star.Star):
         if not messages:
             return ""
 
-        lines = ["[最近的群聊消息]"]
+        lines: list[str] = []
+        if self._sessions.has_session(unified_msg_origin):
+            state = self._sessions.get(unified_msg_origin)
+            summary = getattr(state, "summary", "") or ""
+            if summary:
+                lines.append("[历史摘要]")
+                lines.append(summary)
+                lines.append("")
+
+        lines.append("[最近的群聊消息]")
         for msg in messages:
             name = "[你]" if msg["is_bot"] else msg["sender_name"]
             lines.append(f"{name}: {msg['content']}")
