@@ -166,5 +166,11 @@
     "condition": {
       "history_compress_strategy": "llm_summary"
     }
+  },
+  "waking_regex": {
+    "description": "正则唤醒列表（支持正则表达式，匹配成功则触发唤醒Bot）",
+    "type": "list",
+    "default": [],
+    "hint": "例如：正则表达式 .*Bot.* 匹配到句子中带有`Bot`时触发唤醒。"
   }
 }
